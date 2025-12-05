@@ -31,8 +31,8 @@ from pathlib import Path
 # 导入您的模块
 # 请确保这些import路径与您的项目结构一致
 try:
-    from model import segmamba_mask2former_tiny, segmamba_mask2former_small, segmamba_mask2former_base
-    from dataloader import NPYSegmentationDataset, get_default_transforms
+    from model.model import segmamba_mask2former_tiny, segmamba_mask2former_small, segmamba_mask2former_base
+    from data.dataloader import NPYSegmentationDataset, get_default_transforms
 except ImportError as e:
     print("错误: 无法导入模块。请确保以下文件在正确的位置:")
     print("  - model.py (包含 SegMambaMask2Former)")
