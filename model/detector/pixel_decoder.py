@@ -75,12 +75,12 @@ class SimpleFPNDecoder(nn.Module):
                     nn.ReLU(inplace=True)
                 )
                 nn.init.xavier_uniform_(lateral_conv.weight)
-                if not use_bias:
+                if use_bias:
                     nn.init.constant_(lateral_conv.bias, 0)
                 self.lateral_convs.append(lateral_conv)
             
             nn.init.xavier_uniform_(output_conv[0].weight)
-            if not use_bias:
+            if use_bias:
                 nn.init.constant_(output_conv[0].bias, 0)
             self.output_convs.append(output_conv)
         
