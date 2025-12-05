@@ -1,19 +1,21 @@
 """
 SegMamba + Mask2Former 训练脚本
-完全符合Mask2Former论文实现
-
-关键点:
-1. Hungarian Matching - 二分图匹配
-2. Deep Supervision - 所有decoder层都有loss
-3. 三种loss: Classification + Mask BCE + Dice
-4. Point-based sampling - 省内存
+完全基于您的代码实现和Mask2Former官方训练方法
 
 参考:
-- Mask2Former论文: https://arxiv.org/abs/2112.01527
-- 官方实现: https://github.com/facebookresearch/Mask2Former
+- Mask2Former官方实现: https://github.com/facebookresearch/Mask2Former
+  特别是: modeling/criterion.py, modeling/matcher.py
+- 论文: Masked-attention Mask Transformer for Universal Image Segmentation (CVPR 2022)
+
+核心组件:
+1. Hungarian Matching - 二分图最优匹配
+2. SetCriterion - 三种loss (CE + Mask BCE + Dice)
+3. Deep Supervision - 所有decoder层都计算loss
+4. Point-based Sampling - 节省显存
 """
 
 import os
+import sys
 import argparse
 import torch
 import torch.nn as nn
@@ -26,20 +28,34 @@ from typing import Dict, List, Tuple
 import json
 from pathlib import Path
 
-# 导入我们的模块
-from data.dataloader import NPYSegmentationDataset, get_default_transforms
-from model import segmamba_mask2former_small, segmamba_mask2former_tiny
+# 导入您的模块
+# 请确保这些import路径与您的项目结构一致
+try:
+    from model import segmamba_mask2former_tiny, segmamba_mask2former_small, segmamba_mask2former_base
+    from data.dataloader import NPYSegmentationDataset, get_default_transforms
+except ImportError as e:
+    print("错误: 无法导入模块。请确保以下文件在正确的位置:")
+    print("  - model.py (包含 SegMambaMask2Former)")
+    print("  - dataloader.py (包含 NPYSegmentationDataset)")
+    print("  - segmamba_backbone_2d.py")
+    print("  - pixel_decoder.py")
+    print("  - mask2former_decoder.py")
+    print(f"\n详细错误: {e}")
+    sys.exit(1)
 
 
 # ============================================================================
-# Hungarian Matcher - 完全按照Mask2Former实现
+# Hungarian Matcher (完全基于Mask2Former官方实现)
+# 参考: https://github.com/facebookresearch/Mask2Former/blob/main/mask2former/modeling/matcher.py
 # ============================================================================
 
 class HungarianMatcher(nn.Module):
     """
     Hungarian Matcher用于计算预测和GT之间的最优匹配
     
-    这是Mask2Former的核心组件，基于论文Section 3.1实现
+    实现细节完全基于Mask2Former论文和官方代码:
+    - 论文 Section 3.1: Matching cost
+    - GitHub: modeling/matcher.py
     """
     
     def __init__(
@@ -47,14 +63,14 @@ class HungarianMatcher(nn.Module):
         cost_class: float = 2.0,
         cost_mask: float = 5.0,
         cost_dice: float = 5.0,
-        num_points: int = 12544,  # 论文中用于计算mask loss的采样点数
+        num_points: int = 12544,
     ):
         """
         Args:
-            cost_class: 分类cost的权重
-            cost_mask: mask BCE cost的权重
-            cost_dice: dice cost的权重
-            num_points: 采样点数（用于计算mask cost）
+            cost_class: Classification cost权重
+            cost_mask: Mask BCE cost权重  
+            cost_dice: Dice cost权重
+            num_points: Point sampling数量
         """
         super().__init__()
         self.cost_class = cost_class
@@ -71,22 +87,19 @@ class HungarianMatcher(nn.Module):
         gt_masks: List[torch.Tensor],   # List of (N_i, H, W)
     ) -> List[Tuple[torch.Tensor, torch.Tensor]]:
         """
-        计算匹配
+        计算最优匹配
         
         Returns:
-            List of (src_idx, tgt_idx) tuples
-            src_idx: 预测的索引
-            tgt_idx: GT的索引
+            List of (src_idx, tgt_idx) tuples, length = batch_size
         """
         batch_size, num_queries = pred_logits.shape[:2]
         
-        # 将logits转为概率
+        # Softmax on class dimension
         pred_probs = pred_logits.softmax(-1)  # (B, Q, num_classes+1)
         
         indices = []
         
         for b in range(batch_size):
-            # 当前batch的预测和GT
             pred_prob = pred_probs[b]  # (Q, num_classes+1)
             pred_mask = pred_masks[b]  # (Q, H, W)
             gt_label = gt_labels[b]    # (N,)
@@ -95,7 +108,7 @@ class HungarianMatcher(nn.Module):
             num_gt = len(gt_label)
             
             if num_gt == 0:
-                # 没有GT，不需要匹配
+                # No ground truth - no matching needed
                 indices.append((
                     torch.tensor([], dtype=torch.long),
                     torch.tensor([], dtype=torch.long)
@@ -103,46 +116,49 @@ class HungarianMatcher(nn.Module):
                 continue
             
             # === 1. Classification Cost ===
-            # 取出每个GT类别对应的预测概率
-            cost_class = -pred_prob[:, gt_label]  # (Q, N)
+            # 取出每个GT对应的预测概率 (Q, N)
+            cost_class = -pred_prob[:, gt_label]
             
-            # === 2. Mask Cost ===
-            # Point-based sampling（论文Section 3.3.2）
-            # 随机采样点来计算mask cost，节省内存
+            # === 2. Mask Cost (Point-based sampling) ===
+            # Flatten spatial dimensions
             pred_mask_flat = pred_mask.flatten(1)  # (Q, H*W)
             gt_mask_flat = gt_mask.flatten(1).float()  # (N, H*W)
             
-            # 采样点（如果点数少于num_points，使用所有点）
+            # Sample points
             num_points = min(self.num_points, pred_mask_flat.shape[1])
-            point_idx = torch.randperm(pred_mask_flat.shape[1])[:num_points]
+            point_idx = torch.randperm(pred_mask_flat.shape[1], device=pred_mask.device)[:num_points]
             
             pred_mask_sampled = pred_mask_flat[:, point_idx]  # (Q, num_points)
             gt_mask_sampled = gt_mask_flat[:, point_idx]      # (N, num_points)
             
-            # Sigmoid后计算BCE cost
+            # Sigmoid for BCE
             pred_mask_sampled = pred_mask_sampled.sigmoid()
             
-            # BCE cost: (Q, N)
-            cost_mask = F.binary_cross_entropy_with_logits(
-                pred_mask_sampled.unsqueeze(1).expand(-1, num_gt, -1),  # (Q, N, num_points)
-                gt_mask_sampled.unsqueeze(0).expand(num_queries, -1, -1),
-                reduction='none'
-            ).mean(-1)
+            # BCE cost
+            with torch.cuda.amp.autocast(enabled=False):
+                pred_mask_sampled = pred_mask_sampled.float()
+                gt_mask_sampled = gt_mask_sampled.float()
+                
+                # (Q, N, num_points)
+                cost_mask = F.binary_cross_entropy_with_logits(
+                    pred_mask_sampled.unsqueeze(1).expand(-1, num_gt, -1),
+                    gt_mask_sampled.unsqueeze(0).expand(num_queries, -1, -1),
+                    reduction='none'
+                ).mean(-1)
             
             # === 3. Dice Cost ===
-            # Dice cost: (Q, N)
             numerator = 2 * (pred_mask_sampled.unsqueeze(1) * gt_mask_sampled.unsqueeze(0)).sum(-1)
             denominator = pred_mask_sampled.unsqueeze(1).sum(-1) + gt_mask_sampled.unsqueeze(0).sum(-1)
             cost_dice = 1 - (numerator + 1) / (denominator + 1)
             
-            # === 总Cost ===
+            # === Final Cost ===
             cost = (
                 self.cost_class * cost_class +
                 self.cost_mask * cost_mask +
                 self.cost_dice * cost_dice
             )  # (Q, N)
             
-            # Hungarian算法求最优匹配
+            # Hungarian algorithm
             cost = cost.cpu()
             src_idx, tgt_idx = linear_sum_assignment(cost)
             
@@ -155,28 +171,30 @@ class HungarianMatcher(nn.Module):
 
 
 # ============================================================================
-# Mask2Former Loss - 完全按照论文实现
+# SetCriterion - Mask2Former Loss (完全基于官方实现)
+# 参考: https://github.com/facebookresearch/Mask2Former/blob/main/mask2former/modeling/criterion.py
 # ============================================================================
 
-class Mask2FormerLoss(nn.Module):
+class SetCriterion(nn.Module):
     """
     Mask2Former完整Loss函数
     
-    包含三个部分（论文Section 3.3）:
-    1. Classification Loss
-    2. Mask BCE Loss
-    3. Dice Loss
-    
-    使用Deep Supervision训练所有decoder层
+    实现细节完全基于Mask2Former官方代码:
+    - GitHub: modeling/criterion.py
+    - 包含: CE loss + Mask BCE loss + Dice loss
+    - Deep supervision on all decoder layers
     """
     
     def __init__(
         self,
         num_classes: int,
         matcher: HungarianMatcher,
-        weight_dict: Dict[str, float] = None,
-        eos_coef: float = 0.1,  # 背景类（no-object）的权重
+        weight_dict: Dict[str, float],
+        eos_coef: float = 0.1,
+        losses: List[str] = ["labels", "masks"],
         num_points: int = 12544,
+        oversample_ratio: float = 3.0,
+        importance_sample_ratio: float = 0.75,
     ):
         """
         Args:
@@ -184,74 +202,72 @@ class Mask2FormerLoss(nn.Module):
             matcher: Hungarian matcher
             weight_dict: loss权重字典
             eos_coef: 背景类权重
-            num_points: 采样点数
+            losses: 要计算的loss类型
+            num_points: point sampling数量
+            oversample_ratio: oversampling比例
+            importance_sample_ratio: importance sampling比例
         """
         super().__init__()
-        
         self.num_classes = num_classes
         self.matcher = matcher
+        self.weight_dict = weight_dict
         self.eos_coef = eos_coef
+        self.losses = losses
         self.num_points = num_points
+        self.oversample_ratio = oversample_ratio
+        self.importance_sample_ratio = importance_sample_ratio
         
-        # 默认权重（来自Mask2Former论文）
-        if weight_dict is None:
-            self.weight_dict = {
-                'loss_ce': 2.0,      # Classification
-                'loss_mask': 5.0,    # Mask BCE
-                'loss_dice': 5.0,    # Dice
-            }
-        else:
-            self.weight_dict = weight_dict
-        
-        # 背景类权重调整
-        empty_weight = torch.ones(num_classes + 1)
-        empty_weight[-1] = eos_coef  # 最后一个是背景类
-        self.register_buffer('empty_weight', empty_weight)
+        # 背景类权重
+        empty_weight = torch.ones(self.num_classes + 1)
+        empty_weight[-1] = self.eos_coef
+        self.register_buffer("empty_weight", empty_weight)
     
     def loss_labels(
         self,
-        pred_logits: torch.Tensor,
-        gt_labels: List[torch.Tensor],
+        outputs: Dict,
+        targets: Dict,
         indices: List[Tuple],
-    ) -> torch.Tensor:
-        """
-        Classification Loss
-        """
+        num_masks: int,
+    ) -> Dict[str, torch.Tensor]:
+        """Classification loss (CE)"""
+        pred_logits = outputs["pred_logits"]  # (B, Q, num_classes+1)
+        
         batch_size, num_queries = pred_logits.shape[:2]
         device = pred_logits.device
         
-        # 创建目标标签（所有query默认为背景类）
+        # 创建target labels
         target_classes = torch.full(
             (batch_size, num_queries),
-            self.num_classes,  # 背景类是最后一个
+            self.num_classes,  # 背景类
             dtype=torch.long,
             device=device
         )
         
-        # 根据匹配结果填入真实标签
+        # 根据匹配填入真实标签
         for b, (src_idx, tgt_idx) in enumerate(indices):
             if len(src_idx) > 0:
-                target_classes[b, src_idx] = gt_labels[b][tgt_idx]
+                target_classes[b, src_idx] = targets["labels"][b][tgt_idx]
         
-        # Cross Entropy Loss（使用背景类权重）
+        # CE loss
         loss_ce = F.cross_entropy(
             pred_logits.transpose(1, 2),  # (B, num_classes+1, Q)
             target_classes,
-            weight=self.empty_weight
+            self.empty_weight
         )
         
-        return loss_ce
+        losses = {"loss_ce": loss_ce}
+        return losses
     
     def loss_masks(
         self,
-        pred_masks: torch.Tensor,
-        gt_masks: List[torch.Tensor],
+        outputs: Dict,
+        targets: Dict,
         indices: List[Tuple],
-    ) -> Tuple[torch.Tensor, torch.Tensor]:
-        """
-        Mask BCE Loss + Dice Loss
-        使用point-based sampling（论文Section 3.3.2）
-        """
+        num_masks: int,
+    ) -> Dict[str, torch.Tensor]:
+        """Mask losses: BCE + Dice"""
+        pred_masks = outputs["pred_masks"]  # (B, Q, H, W)
+        
         batch_size = pred_masks.shape[0]
         device = pred_masks.device
         
@@ -261,103 +277,198 @@ class Mask2FormerLoss(nn.Module):
         
         for b, (src_idx, tgt_idx) in enumerate(indices):
             if len(src_idx) > 0:
-                src_masks.append(pred_masks[b, src_idx])      # (N_matched, H, W)
-                target_masks.append(gt_masks[b][tgt_idx])     # (N_matched, H, W)
+                src_masks.append(pred_masks[b, src_idx])
+                target_masks.append(targets["masks"][b][tgt_idx])
         
         if len(src_masks) == 0:
-            # 没有匹配的，返回0 loss
-            return (
-                pred_masks.sum() * 0.0,
-                pred_masks.sum() * 0.0
+            # 没有匹配，返回dummy loss
+            return {
+                "loss_mask": pred_masks.sum() * 0.0,
+                "loss_dice": pred_masks.sum() * 0.0,
+            }
+        
+        src_masks = torch.cat(src_masks, dim=0)      # (N_total, H, W)
+        target_masks = torch.cat(target_masks, dim=0).float()  # (N_total, H, W)
+        
+        # Point sampling (官方实现)
+        with torch.no_grad():
+            point_coords = self.get_point_coords_with_randomness(
+                src_masks.unsqueeze(1),  # (N, 1, H, W)
+                lambda logits: self.calculate_uncertainty(logits),
+                self.num_points,
+                self.oversample_ratio,
+                self.importance_sample_ratio,
             )
         
-        # 拼接所有batch
-        src_masks = torch.cat(src_masks, dim=0)      # (N_total, H, W)
-        target_masks = torch.cat(target_masks, dim=0).float()
+        # Sample points from masks
+        point_labels = self.point_sample(
+            target_masks.unsqueeze(1),
+            point_coords,
+            align_corners=False,
+        ).squeeze(1)  # (N, num_points)
         
-        # Flatten
-        src_masks = src_masks.flatten(1)       # (N_total, H*W)
-        target_masks = target_masks.flatten(1)
-        
-        # Point-based sampling
-        num_points = min(self.num_points, src_masks.shape[1])
-        point_idx = torch.randperm(src_masks.shape[1], device=device)[:num_points]
-        
-        src_masks = src_masks[:, point_idx]      # (N_total, num_points)
-        target_masks = target_masks[:, point_idx]
+        point_logits = self.point_sample(
+            src_masks.unsqueeze(1),
+            point_coords,
+            align_corners=False,
+        ).squeeze(1)  # (N, num_points)
         
         # === BCE Loss ===
         loss_mask = F.binary_cross_entropy_with_logits(
-            src_masks,
-            target_masks,
-            reduction='mean'
+            point_logits,
+            point_labels,
+            reduction="mean"
         )
         
         # === Dice Loss ===
-        src_masks = src_masks.sigmoid()
-        numerator = 2 * (src_masks * target_masks).sum(1)
-        denominator = src_masks.sum(1) + target_masks.sum(1)
-        loss_dice = 1 - (numerator + 1) / (denominator + 1)
-        loss_dice = loss_dice.mean()
-        
-        return loss_mask, loss_dice
-    
-    def forward(
-        self,
-        outputs: Dict,
-        gt_labels: List[torch.Tensor],
-        gt_masks: List[torch.Tensor],
-    ) -> Dict[str, torch.Tensor]:
-        """
-        计算总loss
-        
-        Args:
-            outputs: 模型输出，包含pred_logits, pred_masks, aux_outputs
-            gt_labels: List of (N_i,) 类别标签
-            gt_masks: List of (N_i, H, W) masks
-        """
-        # 最后一层的输出
-        pred_logits = outputs['pred_logits']  # (B, Q, num_classes+1)
-        pred_masks = outputs['pred_masks']    # (B, Q, H, W)
-        
-        # Hungarian Matching
-        indices = self.matcher(pred_logits, pred_masks, gt_labels, gt_masks)
-        
-        # === 计算最后一层的loss ===
-        loss_ce = self.loss_labels(pred_logits, gt_labels, indices)
-        loss_mask, loss_dice = self.loss_masks(pred_masks, gt_masks, indices)
+        loss_dice = self.dice_loss(
+            point_logits.sigmoid(),
+            point_labels,
+            num_masks
+        )
         
         losses = {
-            'loss_ce': loss_ce * self.weight_dict['loss_ce'],
-            'loss_mask': loss_mask * self.weight_dict['loss_mask'],
-            'loss_dice': loss_dice * self.weight_dict['loss_dice'],
+            "loss_mask": loss_mask,
+            "loss_dice": loss_dice,
         }
+        return losses
+    
+    def dice_loss(self, inputs, targets, num_masks):
+        """Dice loss"""
+        inputs = inputs.flatten(1)
+        targets = targets.flatten(1)
         
-        # === Deep Supervision: 所有中间层也计算loss ===
-        if 'aux_outputs' in outputs:
-            for i, aux_outputs in enumerate(outputs['aux_outputs']):
-                aux_pred_logits = aux_outputs['pred_logits']
-                aux_pred_masks = aux_outputs['pred_masks']
-                
-                # 重新匹配（每一层独立匹配）
-                aux_indices = self.matcher(aux_pred_logits, aux_pred_masks, gt_labels, gt_masks)
+        numerator = 2 * (inputs * targets).sum(-1)
+        denominator = inputs.sum(-1) + targets.sum(-1)
+        loss = 1 - (numerator + 1) / (denominator + 1)
+        
+        return loss.sum() / num_masks
+    
+    def calculate_uncertainty(self, logits):
+        """
+        Uncertainty estimation for importance sampling
+        来自官方实现 (modeling/utils.py)
+        """
+        uncertainty = -(logits * logits.sigmoid()).sum(1)
+        return uncertainty
+    
+    def get_point_coords_with_randomness(
+        self,
+        coarse_logits,
+        uncertainty_func,
+        num_points,
+        oversample_ratio,
+        importance_sample_ratio,
+    ):
+        """
+        Point sampling with importance sampling
+        来自官方 point_features.py
+        """
+        num_boxes = coarse_logits.shape[0]
+        num_sampled = int(num_points * oversample_ratio)
+        
+        # Sample uniformly
+        point_coords = torch.rand(num_boxes, num_sampled, 2, device=coarse_logits.device)
+        point_logits = self.point_sample(coarse_logits, point_coords, align_corners=False)
+        
+        # Calculate uncertainty
+        point_uncertainties = uncertainty_func(point_logits)
+        
+        # Importance sampling
+        num_uncertain_points = int(importance_sample_ratio * num_points)
+        num_random_points = num_points - num_uncertain_points
+        
+        idx = torch.topk(point_uncertainties[:, 0, :], k=num_uncertain_points, dim=1)[1]
+        shift = num_sampled * torch.arange(num_boxes, dtype=torch.long, device=coarse_logits.device)
+        idx += shift[:, None]
+        
+        point_coords = point_coords.view(-1, 2)[idx.view(-1), :].view(num_boxes, num_uncertain_points, 2)
+        
+        if num_random_points > 0:
+            random_point_coords = torch.rand(num_boxes, num_random_points, 2, device=coarse_logits.device)
+            point_coords = torch.cat([point_coords, random_point_coords], dim=1)
+        
+        return point_coords
+    
+    def point_sample(self, input, point_coords, **kwargs):
+        """
+        Point sampling
+        来自官方 point_features.py
+        """
+        add_dim = False
+        if point_coords.dim() == 3:
+            add_dim = True
+            point_coords = point_coords.unsqueeze(2)
+        
+        output = F.grid_sample(input, 2.0 * point_coords - 1.0, **kwargs)
+        
+        if add_dim:
+            output = output.squeeze(3)
+        
+        return output
+    
+    def forward(self, outputs: Dict, targets: Dict) -> Dict[str, torch.Tensor]:
+        """
+        计算total loss
+        
+        Args:
+            outputs: 模型输出 {pred_logits, pred_masks, aux_outputs}
+            targets: GT标签 {labels: List[Tensor], masks: List[Tensor]}
+        """
+        # 最后一层的输出
+        outputs_without_aux = {k: v for k, v in outputs.items() if k != "aux_outputs"}
+        
+        # Hungarian Matching
+        indices = self.matcher(
+            outputs_without_aux["pred_logits"],
+            outputs_without_aux["pred_masks"],
+            targets["labels"],
+            targets["masks"]
+        )
+        
+        # 计算GT mask数量（用于normalization）
+        num_masks = sum(len(t) for t in targets["labels"])
+        num_masks = torch.as_tensor(
+            [num_masks], dtype=torch.float, device=next(iter(outputs.values())).device
+        )
+        num_masks = torch.clamp(num_masks, min=1).item()
+        
+        # === 计算最后一层的loss ===
+        losses = {}
+        for loss_name in self.losses:
+            if loss_name == "labels":
+                losses.update(self.loss_labels(outputs_without_aux, targets, indices, num_masks))
+            elif loss_name == "masks":
+                losses.update(self.loss_masks(outputs_without_aux, targets, indices, num_masks))
+        
+        # === Deep Supervision: 中间层的loss ===
+        if "aux_outputs" in outputs:
+            for i, aux_outputs in enumerate(outputs["aux_outputs"]):
+                # 每一层重新matching
+                indices_aux = self.matcher(
+                    aux_outputs["pred_logits"],
+                    aux_outputs["pred_masks"],
+                    targets["labels"],
+                    targets["masks"]
+                )
                 
                 # 计算loss
-                aux_loss_ce = self.loss_labels(aux_pred_logits, gt_labels, aux_indices)
-                aux_loss_mask, aux_loss_dice = self.loss_masks(aux_pred_masks, gt_masks, aux_indices)
-                
-                losses[f'loss_ce_{i}'] = aux_loss_ce * self.weight_dict['loss_ce']
-                losses[f'loss_mask_{i}'] = aux_loss_mask * self.weight_dict['loss_mask']
-                losses[f'loss_dice_{i}'] = aux_loss_dice * self.weight_dict['loss_dice']
+                for loss_name in self.losses:
+                    if loss_name == "labels":
+                        l_dict = self.loss_labels(aux_outputs, targets, indices_aux, num_masks)
+                        losses.update({k + f"_{i}": v for k, v in l_dict.items()})
+                    elif loss_name == "masks":
+                        l_dict = self.loss_masks(aux_outputs, targets, indices_aux, num_masks)
+                        losses.update({k + f"_{i}": v for k, v in l_dict.items()})
         
         return losses
 
 
 # ============================================================================
-# 准备实例格式的GT数据
+# 数据准备函数
 # ============================================================================
 
-def prepare_instance_targets(batch: Dict) -> Tuple[List[torch.Tensor], List[torch.Tensor]]:
+def prepare_targets(batch: Dict) -> Dict:
     """
     将semantic mask转换为instance格式
     
@@ -365,11 +476,11 @@ def prepare_instance_targets(batch: Dict) -> Tuple[List[torch.Tensor], List[torc
         batch: DataLoader返回的batch
         
     Returns:
-        gt_labels: List of (N_i,) 类别标签
-        gt_masks: List of (N_i, H, W) bool masks
+        targets: {labels: List[Tensor], masks: List[Tensor]}
     """
     masks = batch['mask']  # (B, H, W)
     batch_size = masks.shape[0]
+    device = masks.device
     
     gt_labels = []
     gt_masks = []
@@ -377,14 +488,14 @@ def prepare_instance_targets(batch: Dict) -> Tuple[List[torch.Tensor], List[torc
     for b in range(batch_size):
         mask = masks[b]  # (H, W)
         
-        # 提取实例
+        # 提取类别
         unique_classes = torch.unique(mask)
         unique_classes = unique_classes[unique_classes > 0]  # 排除背景
         
         if len(unique_classes) == 0:
-            # 没有前景，创建一个dummy instance
-            gt_labels.append(torch.tensor([0], dtype=torch.long, device=mask.device))
-            gt_masks.append(torch.zeros((1, *mask.shape), dtype=torch.bool, device=mask.device))
+            # 没有前景，创建dummy target
+            gt_labels.append(torch.tensor([0], dtype=torch.long, device=device))
+            gt_masks.append(torch.zeros((1, *mask.shape), dtype=torch.bool, device=device))
         else:
             instance_masks = []
             instance_labels = []
@@ -392,21 +503,21 @@ def prepare_instance_targets(batch: Dict) -> Tuple[List[torch.Tensor], List[torc
             for class_id in unique_classes:
                 class_mask = (mask == class_id)
                 instance_masks.append(class_mask)
-                instance_labels.append(class_id - 1)  # 0-indexed（假设GT是1-indexed）
+                instance_labels.append(class_id - 1)  # 转为0-indexed
             
             gt_masks.append(torch.stack(instance_masks, dim=0))  # (N, H, W)
-            gt_labels.append(torch.tensor(instance_labels, dtype=torch.long, device=mask.device))
+            gt_labels.append(torch.tensor(instance_labels, dtype=torch.long, device=device))
     
-    return gt_labels, gt_masks
+    return {"labels": gt_labels, "masks": gt_masks}
 
 
 # ============================================================================
-# 训练函数
+# 训练和验证函数
 # ============================================================================
 
 def train_one_epoch(
     model: nn.Module,
-    criterion: Mask2FormerLoss,
+    criterion: SetCriterion,
     dataloader: DataLoader,
     optimizer: torch.optim.Optimizer,
     device: torch.device,
@@ -427,38 +538,42 @@ def train_one_epoch(
         images = batch['image'].to(device)
         masks = batch['mask'].to(device)
         
-        # 准备GT（转为instance格式）
-        gt_labels, gt_masks = prepare_instance_targets({'mask': masks})
+        # 准备targets
+        targets = prepare_targets({'mask': masks})
         
         # 前向传播
         optimizer.zero_grad()
         outputs = model(images)
         
         # 计算loss
-        losses = criterion(outputs, gt_labels, gt_masks)
+        loss_dict = criterion(outputs, targets)
         
-        # 总loss
-        loss = sum(losses.values())
+        # 加权loss
+        losses = sum(
+            loss_dict[k] * criterion.weight_dict[k]
+            for k in loss_dict.keys()
+            if k in criterion.weight_dict
+        )
         
         # 反向传播
-        loss.backward()
+        losses.backward()
         
-        # 梯度裁剪（可选，防止梯度爆炸）
+        # 梯度裁剪
         torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=0.01)
         
         optimizer.step()
         
         # 累积loss
-        total_loss += loss.item()
-        for k, v in losses.items():
+        total_loss += losses.item()
+        for k, v in loss_dict.items():
             if k not in loss_dict_accumulated:
                 loss_dict_accumulated[k] = 0
             loss_dict_accumulated[k] += v.item()
         
         # 更新进度条
         pbar.set_postfix({
-            'loss': f'{loss.item():.4f}',
-            'avg_loss': f'{total_loss / (batch_idx + 1):.4f}'
+            'loss': f'{losses.item():.4f}',
+            'avg': f'{total_loss / (batch_idx + 1):.4f}'
         })
     
     # 计算平均loss
@@ -472,7 +587,7 @@ def train_one_epoch(
 @torch.no_grad()
 def validate(
     model: nn.Module,
-    criterion: Mask2FormerLoss,
+    criterion: SetCriterion,
     dataloader: DataLoader,
     device: torch.device,
 ) -> Dict[str, float]:
@@ -490,15 +605,20 @@ def validate(
         images = batch['image'].to(device)
         masks = batch['mask'].to(device)
         
-        gt_labels, gt_masks = prepare_instance_targets({'mask': masks})
+        targets = prepare_targets({'mask': masks})
         
         outputs = model(images)
-        losses = criterion(outputs, gt_labels, gt_masks)
+        loss_dict = criterion(outputs, targets)
         
-        loss = sum(losses.values())
-        total_loss += loss.item()
+        losses = sum(
+            loss_dict[k] * criterion.weight_dict[k]
+            for k in loss_dict.keys()
+            if k in criterion.weight_dict
+        )
         
-        for k, v in losses.items():
+        total_loss += losses.item()
+        
+        for k, v in loss_dict.items():
             if k not in loss_dict_accumulated:
                 loss_dict_accumulated[k] = 0
             loss_dict_accumulated[k] += v.item()
@@ -511,7 +631,7 @@ def validate(
 
 
 # ============================================================================
-# 主训练循环
+# 主训练函数
 # ============================================================================
 
 def main(args):
@@ -581,6 +701,12 @@ def main(args):
             num_queries=args.num_queries,
             in_chans=1,
         )
+    elif args.model_size == 'base':
+        model = segmamba_mask2former_base(
+            num_classes=args.num_classes,
+            num_queries=args.num_queries,
+            in_chans=1,
+        )
     else:
         raise ValueError(f"Unknown model size: {args.model_size}")
     
@@ -590,8 +716,8 @@ def main(args):
     print(f"  Model: {args.model_size}")
     print(f"  Parameters: {num_params / 1e6:.2f}M")
     
-    # ===== 3. 创建Matcher和Loss =====
-    print("\n[3] Creating loss function...")
+    # ===== 3. 创建Matcher和Criterion =====
+    print("\n[3] Creating criterion...")
     
     matcher = HungarianMatcher(
         cost_class=args.cost_class,
@@ -600,19 +726,32 @@ def main(args):
         num_points=args.num_points,
     )
     
-    criterion = Mask2FormerLoss(
+    # Weight dict (包含所有decoder层)
+    num_decoder_layers = model.get_num_layers()
+    weight_dict = {"loss_ce": args.class_weight, "loss_mask": args.mask_weight, "loss_dice": args.dice_weight}
+    
+    # Deep supervision weights
+    aux_weight_dict = {}
+    for i in range(num_decoder_layers - 1):
+        aux_weight_dict.update({k + f"_{i}": v for k, v in weight_dict.items()})
+    weight_dict.update(aux_weight_dict)
+    
+    criterion = SetCriterion(
         num_classes=args.num_classes,
         matcher=matcher,
-        weight_dict={
-            'loss_ce': args.weight_ce,
-            'loss_mask': args.weight_mask,
-            'loss_dice': args.weight_dice,
-        },
+        weight_dict=weight_dict,
         eos_coef=args.eos_coef,
+        losses=["labels", "masks"],
         num_points=args.num_points,
+        oversample_ratio=args.oversample_ratio,
+        importance_sample_ratio=args.importance_sample_ratio,
     )
     
     criterion = criterion.to(device)
+    
+    print(f"  Matcher: cost_class={args.cost_class}, cost_mask={args.cost_mask}, cost_dice={args.cost_dice}")
+    print(f"  Loss weights: CE={args.class_weight}, Mask={args.mask_weight}, Dice={args.dice_weight}")
+    print(f"  Deep supervision: {num_decoder_layers} layers")
     
     # ===== 4. 创建优化器 =====
     print("\n[4] Creating optimizer...")
@@ -623,7 +762,6 @@ def main(args):
         weight_decay=args.weight_decay,
     )
     
-    # 学习率调度器
     scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(
         optimizer,
         T_max=args.epochs,
@@ -656,9 +794,9 @@ def main(args):
         # 打印结果
         print(f"\nEpoch {epoch} Results:")
         print(f"  Train Loss: {train_loss_dict['total_loss']:.4f}")
-        print(f"    - CE: {train_loss_dict['loss_ce']:.4f}")
-        print(f"    - Mask: {train_loss_dict['loss_mask']:.4f}")
-        print(f"    - Dice: {train_loss_dict['loss_dice']:.4f}")
+        print(f"    - CE: {train_loss_dict.get('loss_ce', 0):.4f}")
+        print(f"    - Mask: {train_loss_dict.get('loss_mask', 0):.4f}")
+        print(f"    - Dice: {train_loss_dict.get('loss_dice', 0):.4f}")
         print(f"  Val Loss: {val_loss_dict['total_loss']:.4f}")
         print(f"  LR: {optimizer.param_groups[0]['lr']:.6f}")
         
@@ -718,7 +856,7 @@ if __name__ == "__main__":
     
     # 模型参数
     parser.add_argument('--model_size', type=str, default='small',
-                       choices=['tiny', 'small'],
+                       choices=['tiny', 'small', 'base'],
                        help='Model size')
     parser.add_argument('--num_queries', type=int, default=20,
                        help='Number of queries')
@@ -735,23 +873,31 @@ if __name__ == "__main__":
     parser.add_argument('--num_workers', type=int, default=4,
                        help='Number of data loading workers')
     
-    # Loss权重（来自Mask2Former论文）
+    # Matcher权重 (来自Mask2Former论文)
     parser.add_argument('--cost_class', type=float, default=2.0,
                        help='Classification cost weight for matching')
     parser.add_argument('--cost_mask', type=float, default=5.0,
                        help='Mask cost weight for matching')
     parser.add_argument('--cost_dice', type=float, default=5.0,
                        help='Dice cost weight for matching')
-    parser.add_argument('--weight_ce', type=float, default=2.0,
+    
+    # Loss权重 (来自Mask2Former论文)
+    parser.add_argument('--class_weight', type=float, default=2.0,
                        help='Classification loss weight')
-    parser.add_argument('--weight_mask', type=float, default=5.0,
+    parser.add_argument('--mask_weight', type=float, default=5.0,
                        help='Mask BCE loss weight')
-    parser.add_argument('--weight_dice', type=float, default=5.0,
+    parser.add_argument('--dice_weight', type=float, default=5.0,
                        help='Dice loss weight')
     parser.add_argument('--eos_coef', type=float, default=0.1,
                        help='Background class weight')
+    
+    # Point sampling参数 (来自Mask2Former论文)
     parser.add_argument('--num_points', type=int, default=12544,
                        help='Number of points for sampling')
+    parser.add_argument('--oversample_ratio', type=float, default=3.0,
+                       help='Oversample ratio for point sampling')
+    parser.add_argument('--importance_sample_ratio', type=float, default=0.75,
+                       help='Importance sample ratio for point sampling')
     
     # 输出参数
     parser.add_argument('--output_dir', type=str, default='./outputs',
