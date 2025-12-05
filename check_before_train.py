@@ -369,7 +369,7 @@ def estimate_memory(batch_size=4, image_size=256):
     print("-" * 40)
     
     try:
-        from model import segmamba_mask2former_small
+        from model.model import segmamba_mask2former_small
         
         model = segmamba_mask2former_small(num_classes=1, num_queries=20)
         
