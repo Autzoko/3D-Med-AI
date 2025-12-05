@@ -430,8 +430,19 @@ def calculate_dice_score(pred_masks, pred_logits, gt_masks, threshold=0.5):
         pred_masks_binary.append((best_mask.sigmoid() > threshold).float())
     
     pred_masks_binary = torch.stack(pred_masks_binary)  # (B, H, W)
-    gt_masks_binary = (gt_masks > 0).float()  # (B, H, W)
-    
+    gt_masks_binary = (gt_masks > 0).float()  # (B, H_gt, W_gt)
+
+    # ===== 修复：处理尺寸不匹配 =====
+    if pred_masks_binary.shape[-2:] != gt_masks_binary.shape[-2:]:
+        pred_masks_binary = F.interpolate(
+            pred_masks_binary.unsqueeze(1),  # (B, 1, H, W)
+            size=gt_masks_binary.shape[-2:],  # resize到gt尺寸
+            mode='bilinear',
+            align_corners=False
+        ).squeeze(1)  # (B, H_gt, W_gt)
+        # 重新二值化
+        pred_masks_binary = (pred_masks_binary > 0.5).float()
+
     # 计算Dice
     intersection = (pred_masks_binary * gt_masks_binary).sum()
     union = pred_masks_binary.sum() + gt_masks_binary.sum()
