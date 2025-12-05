@@ -34,8 +34,8 @@ from typing import Dict, List, Tuple
 from scipy.optimize import linear_sum_assignment
 
 # 导入模型和数据
-from model import segmamba_mask2former_tiny, segmamba_mask2former_small, segmamba_mask2former_base
-from dataloader import NPYSegmentationDataset, get_default_transforms
+from model.model import segmamba_mask2former_tiny, segmamba_mask2former_small, segmamba_mask2former_base
+from data.dataloader import NPYSegmentationDataset, get_default_transforms
 
 
 # ============================================================================

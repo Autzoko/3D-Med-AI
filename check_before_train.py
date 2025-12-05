@@ -212,7 +212,7 @@ def check_model_import():
     print("-" * 40)
     
     try:
-        from model import segmamba_mask2former_small
+        from model.model import segmamba_mask2former_small
         print("  ✓ model.segmamba_mask2former_small")
     except ImportError as e:
         print(f"  ✗ 无法导入 segmamba_mask2former_small")
@@ -220,7 +220,7 @@ def check_model_import():
         return False
     
     try:
-        from dataloader import NPYSegmentationDataset, get_default_transforms
+        from data.dataloader import NPYSegmentationDataset, get_default_transforms
         print("  ✓ dataloader.NPYSegmentationDataset")
         print("  ✓ dataloader.get_default_transforms")
     except ImportError as e:
@@ -238,7 +238,7 @@ def check_model_creation():
     print("-" * 40)
     
     try:
-        from model import segmamba_mask2former_small
+        from model.model import segmamba_mask2former_small
         
         model = segmamba_mask2former_small(num_classes=1, num_queries=20, in_chans=1)
         
@@ -282,7 +282,7 @@ def check_dataloader(data_root):
     print("-" * 40)
     
     try:
-        from dataloader import NPYSegmentationDataset, get_default_transforms
+        from data.dataloader import NPYSegmentationDataset, get_default_transforms
         from torch.utils.data import DataLoader
         
         # 创建dataset
@@ -369,7 +369,7 @@ def estimate_memory(batch_size=4, image_size=256):
     print("-" * 40)
     
     try:
-        from model import segmamba_mask2former_small
+        from model.model import segmamba_mask2former_small
         
         model = segmamba_mask2former_small(num_classes=1, num_queries=20)
         
@@ -418,8 +418,8 @@ def check_full_pipeline(data_root):
     print("-" * 40)
     
     try:
-        from model import segmamba_mask2former_small
-        from dataloader import NPYSegmentationDataset, get_default_transforms
+        from model.model import segmamba_mask2former_small
+        from data.dataloader import NPYSegmentationDataset, get_default_transforms
         from torch.utils.data import DataLoader
         from train import SetCriterion, HungarianMatcher, prepare_targets
         
