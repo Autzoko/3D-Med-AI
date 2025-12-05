@@ -423,9 +423,19 @@ def check_full_pipeline(data_root):
         from torch.utils.data import DataLoader
         from train import SetCriterion, HungarianMatcher, prepare_targets
         
+        # 设置device
+        device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
+        if device.type == 'cpu':
+            print("  ⚠️  警告: 未检测到GPU，Mamba模块需要GPU才能运行")
+            print("  跳过完整流程测试（训练时必须使用GPU）")
+            return True
+        
+        print(f"  使用设备: {device}")
+        
         # 1. 创建模型
         model = segmamba_mask2former_small(num_classes=1, num_queries=20)
-        print("  ✓ 模型创建")
+        model = model.to(device)  # 移到GPU
+        print("  ✓ 模型创建并移至GPU")
         
         # 2. 创建DataLoader
         dataset = NPYSegmentationDataset(
@@ -440,9 +450,9 @@ def check_full_pipeline(data_root):
         
         # 3. 获取一个batch
         batch = next(iter(loader))
-        images = batch['image']
-        masks = batch['mask']
-        print(f"  ✓ 获取batch: images={images.shape}, masks={masks.shape}")
+        images = batch['image'].to(device)  # 移到GPU
+        masks = batch['mask'].to(device)    # 移到GPU
+        print(f"  ✓ 获取batch并移至GPU: images={images.shape}, masks={masks.shape}")
         
         # 4. 前向传播
         with torch.no_grad():
@@ -480,7 +490,8 @@ def check_full_pipeline(data_root):
             weight_dict=weight_dict,
             eos_coef=0.1,
         )
-        print("  ✓ Criterion创建")
+        criterion = criterion.to(device)  # 移到GPU
+        print("  ✓ Criterion创建并移至GPU")
         
         # 7. 计算loss
         with torch.no_grad():
