@@ -1,4 +1,3 @@
-
 """
 Simple Segmentation Decoder for SegMamba 2D
 模仿SegMamba原版的简单上采样结构
@@ -86,10 +85,10 @@ class SimpleSegDecoder(nn.Module):
         """
         Args:
             features: list of [f1, f2, f3, f4]
-                f1: (B, 48, H/4, W/4)
-                f2: (B, 96, H/8, W/8)
-                f3: (B, 192, H/16, W/16)
-                f4: (B, 384, H/32, W/32)
+                f1: (B, 48, H/2, W/2)    # 相对于输入H
+                f2: (B, 96, H/4, W/4)
+                f3: (B, 192, H/8, W/8)
+                f4: (B, 384, H/16, W/16)
         
         Returns:
             seg_out: (B, num_classes, H, W)
@@ -98,27 +97,27 @@ class SimpleSegDecoder(nn.Module):
         
         # Top-down pathway（自顶向下融合）
         # Stage 4 (最小的feature map)
-        p4 = self.lateral4(f4)  # (B, 256, H/32, W/32)
+        p4 = self.lateral4(f4)  # (B, 256, H/16, W/16)
         p4 = self.smooth4(p4)
         
         # Stage 3
-        p3 = self.lateral3(f3)  # (B, 256, H/16, W/16)
+        p3 = self.lateral3(f3)  # (B, 256, H/8, W/8)
         p3 = p3 + F.interpolate(p4, size=p3.shape[-2:], mode='bilinear', align_corners=False)
         p3 = self.smooth3(p3)
         
         # Stage 2
-        p2 = self.lateral2(f2)  # (B, 256, H/8, W/8)
+        p2 = self.lateral2(f2)  # (B, 256, H/4, W/4)
         p2 = p2 + F.interpolate(p3, size=p2.shape[-2:], mode='bilinear', align_corners=False)
         p2 = self.smooth2(p2)
         
         # Stage 1
-        p1 = self.lateral1(f1)  # (B, 256, H/4, W/4)
+        p1 = self.lateral1(f1)  # (B, 256, H/2, W/2)
         p1 = p1 + F.interpolate(p2, size=p1.shape[-2:], mode='bilinear', align_corners=False)
         p1 = self.smooth1(p1)
         
         # Final upsampling and segmentation
-        out = self.seg_head(p1)  # (B, num_classes, H/4, W/4)
-        out = F.interpolate(out, scale_factor=4, mode='bilinear', align_corners=False)  # (B, num_classes, H, W)
+        out = self.seg_head(p1)  # (B, num_classes, H/2, W/2)
+        out = F.interpolate(out, scale_factor=2, mode='bilinear', align_corners=False)  # (B, num_classes, H, W)
         
         return out
 
