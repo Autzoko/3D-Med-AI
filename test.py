@@ -271,7 +271,7 @@ def main(args):
         root_dir=args.data_root,
         split=args.split,
         image_size=args.image_size,
-        transform=None,  # 测试时不用数据增强
+        transforms=None,  # 测试时不用数据增强
     )
     
     test_loader = DataLoader(
