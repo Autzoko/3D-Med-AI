@@ -11,11 +11,11 @@ import sys
 sys.path.append('.')
 
 try:
-    from model.backbone.segmamba_backbone_2d import SegMamba2DBackbone
+    from model.backbone.segmamba_backbone_2d import SegMambaBackbone2D
     from model.detector.simple_decoder import SimpleSegDecoder
 except ImportError:
     print("Warning: Using relative import")
-    from backbone.segmamba_backbone_2d import SegMamba2DBackbone
+    from backbone.segmamba_backbone_2d import SegMambaBackbone2D
 
 
 class SegMamba2DSimple(nn.Module):
@@ -64,7 +64,7 @@ class SegMamba2DSimple(nn.Module):
         print(f"[SegMamba2DSimple] Creating {backbone_name} model...")
         
         # 1. Backbone
-        self.backbone = SegMamba2DBackbone(
+        self.backbone = SegMambaBackbone2D(
             model_name=backbone_name,
             in_chans=in_chans,
             drop_path_rate=drop_path_rate,
