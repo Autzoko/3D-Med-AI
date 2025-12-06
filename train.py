@@ -28,9 +28,6 @@ from typing import Dict, List, Tuple
 import json
 from pathlib import Path
 
-# MONAI for Dice metric
-from monai.metrics import DiceMetric
-
 # 导入您的模块
 # 请确保这些import路径与您的项目结构一致
 try:
@@ -479,67 +476,6 @@ class SetCriterion(nn.Module):
 
 
 # ============================================================================
-# Dice Score Calculation (for evaluation, not training)
-# ============================================================================
-
-@torch.no_grad()
-def calculate_dice_score(pred_masks, pred_logits, gt_masks, threshold=0.5):
-    """
-    计算真正的Dice Score（评估指标）
-    
-    Args:
-        pred_masks: (B, Q, H, W) - 预测的masks
-        pred_logits: (B, Q, C+1) - 预测的类别logits（包含background）
-        gt_masks: (B, 1, H, W) or (B, H, W) - GT masks
-        threshold: float - 二值化阈值
-    
-    Returns:
-        dice_score: float [0, 1]，越高越好
-    """
-    B, Q, H, W = pred_masks.shape
-    
-    # 确保gt_masks是(B, 1, H, W)
-    if gt_masks.dim() == 3:
-        gt_masks = gt_masks.unsqueeze(1)  # (B, H, W) -> (B, 1, H, W)
-    
-    # 方法：选择confidence最高的query作为最终预测
-    # pred_logits: (B, Q, C+1)，最后一维是background
-    # 我们要找前景类别（非background）的最高confidence
-    
-    # 计算前景类别的confidence（所有非background类）
-    foreground_probs = pred_logits.softmax(dim=-1)[..., :-1]  # (B, Q, C) 排除background
-    confidences = foreground_probs.max(dim=-1)[0]  # (B, Q) 每个query的最大前景confidence
-    
-    # 选择confidence最高的query
-    best_queries = confidences.argmax(dim=1)  # (B,)
-    
-    # 提取对应的mask预测
-    final_masks = torch.stack([
-        pred_masks[b, best_queries[b]] for b in range(B)
-    ])  # (B, H, W)
-    
-    # 二值化
-    pred_binary = (final_masks.sigmoid() > threshold).float().unsqueeze(1)  # (B, 1, H, W)
-    gt_binary = (gt_masks > 0).float()  # (B, 1, H, W)
-    
-    # 使用MONAI计算Dice Score
-    dice_metric = DiceMetric(include_background=False, reduction="mean_batch")
-    dice_score = dice_metric(y_pred=pred_binary, y=gt_binary)
-    
-    # 如果batch中某些样本没有前景，dice_metric可能返回nan，需要处理
-    if torch.isnan(dice_score).any():
-        # 只计算有效样本
-        valid_mask = ~torch.isnan(dice_score)
-        if valid_mask.any():
-            dice_score = dice_score[valid_mask].mean()
-        else:
-            dice_score = torch.tensor(0.0)
-    
-    return dice_score.item()
-
-
-
-# ============================================================================
 # 数据准备函数
 # ============================================================================
 
@@ -663,6 +599,60 @@ def train_one_epoch(
 
 
 @torch.no_grad()
+
+# ============================================================================
+# Dice Score Calculation (简单手动实现，用于评估)
+# ============================================================================
+
+@torch.no_grad()
+def calculate_dice_score(pred_masks, pred_logits, gt_masks, threshold=0.5):
+    """
+    手动计算Dice Score（评估指标，非训练loss）
+    
+    Args:
+        pred_masks: (B, Q, H, W) - 预测的masks
+        pred_logits: (B, Q, C+1) - 预测的类别logits
+        gt_masks: (B, 1, H, W) or (B, H, W) - GT masks
+        threshold: float - 二值化阈值
+    
+    Returns:
+        dice_score: float [0, 1]，越高越好
+    """
+    B, Q, H, W = pred_masks.shape
+    
+    # 确保gt_masks是4D
+    if gt_masks.dim() == 3:
+        gt_masks = gt_masks.unsqueeze(1)
+    
+    # 选择confidence最高的query
+    foreground_probs = pred_logits.softmax(dim=-1)[..., :-1]  # (B, Q, C) 排除background
+    confidences = foreground_probs.max(dim=-1)[0]  # (B, Q)
+    best_queries = confidences.argmax(dim=1)  # (B,)
+    
+    # 提取最佳预测mask
+    final_masks = torch.stack([
+        pred_masks[b, best_queries[b]] for b in range(B)
+    ])  # (B, H, W)
+    
+    # 二值化
+    pred_binary = (final_masks.sigmoid() > threshold).float()  # (B, H, W)
+    gt_binary = (gt_masks.squeeze(1) > 0).float()  # (B, H, W)
+    
+    # 计算Dice Score: 2 * |A∩B| / (|A| + |B|)
+    intersection = (pred_binary * gt_binary).sum(dim=[1, 2])  # (B,)
+    union = pred_binary.sum(dim=[1, 2]) + gt_binary.sum(dim=[1, 2])  # (B,)
+    
+    # 避免除零
+    dice = (2 * intersection + 1e-6) / (union + 1e-6)  # (B,)
+    
+    # 返回batch平均值
+    return dice.mean().item()
+
+
+# ============================================================================
+# 验证函数
+# ============================================================================
+
 def validate(
     model: nn.Module,
     criterion: SetCriterion,
@@ -697,7 +687,6 @@ def validate(
             outputs = model(images)
             loss_dict = criterion(outputs, targets)
             
-            # 计算加权loss
             losses = sum(
                 loss_dict[k] * criterion.weight_dict[k]
                 for k in loss_dict.keys()
@@ -706,13 +695,12 @@ def validate(
             
             total_loss += losses.item()
             
-            # 累积各项loss
             for k, v in loss_dict.items():
                 if k not in loss_dict_accumulated:
                     loss_dict_accumulated[k] = 0
                 loss_dict_accumulated[k] += v.item()
             
-            # ✅ 计算真实的Dice Score
+            # 计算真实Dice Score
             dice_score = calculate_dice_score(
                 outputs["pred_masks"],
                 outputs["pred_logits"],
@@ -721,10 +709,9 @@ def validate(
             total_dice_score += dice_score
             num_batches += 1
             
-            # 更新进度条显示
+            # 更新进度条
             pbar.set_postfix({'loss': f'{losses.item():.4f}', 'dice': f'{dice_score:.4f}'})
     
-    # 计算平均值
     avg_losses = {k: v / num_batches for k, v in loss_dict_accumulated.items()}
     avg_losses['total_loss'] = total_loss / num_batches
     avg_dice_score = total_dice_score / num_batches
@@ -885,7 +872,7 @@ def main(args):
     print("=" * 80)
     
     best_val_loss = float('inf')
-    best_val_dice = 0.0  # ✅ Dice Score越高越好
+    best_val_dice = 0.0  # Dice Score越高越好
     train_losses = []
     val_losses = []
     
@@ -909,9 +896,9 @@ def main(args):
         print(f"  Train Loss: {train_loss_dict['total_loss']:.4f}")
         print(f"    - CE: {train_loss_dict.get('loss_ce', 0):.4f}")
         print(f"    - Mask: {train_loss_dict.get('loss_mask', 0):.4f}")
-        print(f"    - Dice: {train_loss_dict.get('loss_dice', 0):.4f}")
+        print(f"    - Dice Loss: {train_loss_dict.get('loss_dice', 0):.4f}")
         print(f"  Val Loss: {val_loss_dict['total_loss']:.4f}")
-        print(f"  Val Dice Score: {val_dice_score:.4f}")  # ✅ 真实的Dice Score
+        print(f"  Val Dice Score: {val_dice_score:.4f}")  # 真实Dice Score
         print(f"  LR: {optimizer.param_groups[0]['lr']:.6f}")
         
         # 保存loss历史
@@ -927,7 +914,7 @@ def main(args):
                 'scheduler_state_dict': scheduler.state_dict(),
                 'train_loss': train_loss_dict,
                 'val_loss': val_loss_dict,
-                'val_dice_score': val_dice_score,  # ✅ 保存dice score
+                'val_dice_score': val_dice_score,  # 保存dice score
             }
             torch.save(
                 checkpoint,
@@ -935,7 +922,7 @@ def main(args):
             )
             print(f"  ✓ Saved checkpoint: checkpoint_epoch_{epoch}.pth")
         
-        # 保存最佳模型（基于Dice Score，越高越好）
+        # 保存最佳模型（基于Dice Score）
         if val_dice_score > best_val_dice:
             best_val_dice = val_dice_score
             torch.save(
