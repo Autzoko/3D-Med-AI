@@ -536,14 +536,22 @@ def train_one_epoch(
     optimizer: torch.optim.Optimizer,
     device: torch.device,
     epoch: int,
-) -> Dict[str, float]:
-    """训练一个epoch"""
+) -> Tuple[Dict[str, float], float]:
+    """
+    训练一个epoch
+    
+    Returns:
+        loss_dict: 各项loss的字典
+        dice_score: 真实的Dice Score (0-1，越高越好)
+    """
     
     model.train()
     criterion.train()
     
     total_loss = 0
     loss_dict_accumulated = {}
+    total_dice_score = 0
+    num_batches = 0
     
     pbar = tqdm(dataloader, desc=f'Epoch {epoch}')
     
@@ -584,18 +592,28 @@ def train_one_epoch(
                 loss_dict_accumulated[k] = 0
             loss_dict_accumulated[k] += v.item()
         
+        # 计算真实Dice Score（不参与梯度）
+        with torch.no_grad():
+            dice_score = calculate_dice_score(
+                outputs["pred_masks"],
+                outputs["pred_logits"],
+                masks
+            )
+            total_dice_score += dice_score
+            num_batches += 1
+        
         # 更新进度条
         pbar.set_postfix({
             'loss': f'{losses.item():.4f}',
             'avg': f'{total_loss / (batch_idx + 1):.4f}'
         })
     
-    # 计算平均loss
-    num_batches = len(dataloader)
+    # 计算平均loss和dice
     avg_losses = {k: v / num_batches for k, v in loss_dict_accumulated.items()}
     avg_losses['total_loss'] = total_loss / num_batches
+    avg_dice_score = total_dice_score / num_batches
     
-    return avg_losses
+    return avg_losses, avg_dice_score
 
 
 @torch.no_grad()
@@ -634,7 +652,10 @@ def calculate_dice_score(pred_masks, pred_logits, gt_masks, threshold=0.5):
         pred_masks[b, best_queries[b]] for b in range(B)
     ])  # (B, H, W)
     
-    # 上采样pred到gt的尺寸
+    # 上采样到GT尺寸（Mask2Former设计：预测是H/4×W/4，评估需要上采样到原图）
+    # 这是标准做法，不会丧失准确率：
+    # - 训练时用point sampling，不需要全分辨率
+    # - 评估时需要全分辨率计算Dice
     final_masks = F.interpolate(
         final_masks.unsqueeze(1),  # (B, 1, H, W)
         size=gt_masks.shape[-2:],   # (gt_H, gt_W)
@@ -888,8 +909,8 @@ def main(args):
         print(f"\nEpoch {epoch}/{args.epochs}")
         print("-" * 80)
         
-        # 训练
-        train_loss_dict = train_one_epoch(
+        # 训练（返回loss和dice score）
+        train_loss_dict, train_dice_score = train_one_epoch(
             model, criterion, train_loader, optimizer, device, epoch
         )
         
@@ -905,8 +926,9 @@ def main(args):
         print(f"    - CE: {train_loss_dict.get('loss_ce', 0):.4f}")
         print(f"    - Mask: {train_loss_dict.get('loss_mask', 0):.4f}")
         print(f"    - Dice Loss: {train_loss_dict.get('loss_dice', 0):.4f}")
+        print(f"  Train Dice Score: {train_dice_score:.4f}")  # 真实Train Dice Score
         print(f"  Val Loss: {val_loss_dict['total_loss']:.4f}")
-        print(f"  Val Dice Score: {val_dice_score:.4f}")  # 真实Dice Score
+        print(f"  Val Dice Score: {val_dice_score:.4f}")
         print(f"  LR: {optimizer.param_groups[0]['lr']:.6f}")
         
         # 保存loss历史
