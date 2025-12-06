@@ -117,7 +117,10 @@ class HungarianMatcher(nn.Module):
             
             # === 1. Classification Cost ===
             # 取出每个GT对应的预测概率 (Q, N)
-            cost_class = -pred_prob[:, gt_label]
+            # 🔧 修复：确保gt_label在有效范围内
+            max_class_id = pred_prob.shape[-1] - 1
+            gt_label_safe = torch.clamp(gt_label.long(), 0, max_class_id)
+            cost_class = -pred_prob[:, gt_label_safe]
             
             # === 2. Mask Cost (Point-based sampling) ===
             # Flatten spatial dimensions
@@ -246,7 +249,10 @@ class SetCriterion(nn.Module):
         # 根据匹配填入真实标签
         for b, (src_idx, tgt_idx) in enumerate(indices):
             if len(src_idx) > 0:
-                target_classes[b, src_idx] = targets["labels"][b][tgt_idx]
+                # 🔧 修复：确保label在有效范围内
+                tgt_labels = targets["labels"][b][tgt_idx].long()
+                tgt_labels = torch.clamp(tgt_labels, 0, self.num_classes)
+                target_classes[b, src_idx] = tgt_labels
         
         # CE loss
         loss_ce = F.cross_entropy(
@@ -508,7 +514,10 @@ def prepare_targets(batch: Dict) -> Dict:
             for class_id in unique_classes:
                 class_mask = (mask == class_id)
                 instance_masks.append(class_mask)
-                instance_labels.append(class_id - 1)  # 转为0-indexed
+                # 🔧 修复：确保label在合理范围内
+                label = int(class_id.item()) - 1
+                label = max(0, min(label, 100))  # 防止负数和过大值
+                instance_labels.append(label)
             
             gt_masks.append(torch.stack(instance_masks, dim=0))  # (N, H, W)
             gt_labels.append(torch.tensor(instance_labels, dtype=torch.long, device=device))
