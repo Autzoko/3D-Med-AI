@@ -707,16 +707,22 @@ def main(args):
         model = segmamba_mask2former_tiny(
             num_classes=args.num_classes,
             num_queries=args.num_queries,
+            drop_path_rate=args.drop_path_rate,
+            use_skip_connections=args.use_skip_connections,
         )
     elif args.model_size == 'small':
         model = segmamba_mask2former_small(
             num_classes=args.num_classes,
             num_queries=args.num_queries,
+            drop_path_rate=args.drop_path_rate,
+            use_skip_connections=args.use_skip_connections,
         )
     elif args.model_size == 'base':
         model = segmamba_mask2former_base(
             num_classes=args.num_classes,
             num_queries=args.num_queries,
+            drop_path_rate=args.drop_path_rate,
+            use_skip_connections=args.use_skip_connections,
         )
     else:
         raise ValueError(f"Unknown model size: {args.model_size}")
@@ -726,6 +732,12 @@ def main(args):
     num_params = sum(p.numel() for p in model.parameters())
     print(f"  Model: {args.model_size}")
     print(f"  Parameters: {num_params / 1e6:.2f}M")
+    
+    # 显示增强功能状态
+    if args.drop_path_rate > 0:
+        print(f"  ✓ DropPath enabled: rate={args.drop_path_rate}")
+    if args.use_skip_connections:
+        print(f"  ✓ Skip Connections enabled")
     
     # ===== 3. 创建Matcher和Criterion =====
     print("\n[3] Creating criterion...")
@@ -871,6 +883,12 @@ if __name__ == "__main__":
                        help='Model size')
     parser.add_argument('--num_queries', type=int, default=20,
                        help='Number of queries')
+    
+    # 增强功能参数 (新增)
+    parser.add_argument('--drop_path_rate', type=float, default=0.0,
+                       help='DropPath rate for regularization (0.0=disabled, 0.1-0.15 recommended)')
+    parser.add_argument('--use_skip_connections', action='store_true',
+                       help='Enable encoder-decoder skip connections (U-Net style)')
     
     # 训练参数
     parser.add_argument('--batch_size', type=int, default=4,
