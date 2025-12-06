@@ -150,8 +150,9 @@ class HungarianMatcher(nn.Module):
                 ).mean(-1)
             
             # === 3. Dice Cost ===
-            numerator = 2 * (pred_mask_sampled.unsqueeze(1) * gt_mask_sampled.unsqueeze(0)).sum(-1)
-            denominator = pred_mask_sampled.unsqueeze(1).sum(-1) + gt_mask_sampled.unsqueeze(0).sum(-1)
+            pred_prob_sampled = pred_mask_sampled.sigmoid()
+            numerator = 2 * (pred_prob_sampled.unsqueeze(1) * gt_mask_sampled.unsqueeze(0)).sum(-1)
+            denominator = pred_prob_sampled.unsqueeze(1).sum(-1) + gt_mask_sampled.unsqueeze(0).sum(-1)
             cost_dice = 1 - (numerator + 1) / (denominator + 1)
             
             # === Final Cost ===
@@ -492,36 +493,25 @@ def prepare_targets(batch: Dict) -> Dict:
     masks = batch['mask']  # (B, H, W)
     batch_size = masks.shape[0]
     device = masks.device
-    
+
     gt_labels = []
     gt_masks = []
-    
+
     for b in range(batch_size):
         mask = masks[b]  # (H, W)
-        
-        # 提取类别
-        unique_classes = torch.unique(mask)
-        unique_classes = unique_classes[unique_classes > 0]  # 排除背景
-        
-        if len(unique_classes) == 0:
-            # 没有前景，创建dummy target
-            gt_labels.append(torch.tensor([0], dtype=torch.long, device=device))
-            gt_masks.append(torch.zeros((1, *mask.shape), dtype=torch.bool, device=device))
+
+        # 二值前景
+        fg = (mask > 0)
+
+        if fg.sum() == 0:
+            # ✅ 没有前景：不创建任何 instance
+            gt_labels.append(torch.zeros(0, dtype=torch.long, device=device))           # (0,)
+            gt_masks.append(torch.zeros((0, *mask.shape), dtype=torch.bool, device=device))  # (0, H, W)
         else:
-            instance_masks = []
-            instance_labels = []
-            
-            for class_id in unique_classes:
-                class_mask = (mask == class_id)
-                instance_masks.append(class_mask)
-                # 🔧 修复：确保label在合理范围内
-                label = int(class_id.item()) - 1
-                label = max(0, min(label, 100))  # 防止负数和过大值
-                instance_labels.append(label)
-            
-            gt_masks.append(torch.stack(instance_masks, dim=0))  # (N, H, W)
-            gt_labels.append(torch.tensor(instance_labels, dtype=torch.long, device=device))
-    
+            # ✅ 有且只有一个前景实例（BUSI 当前是二类：前景/背景）
+            gt_labels.append(torch.zeros(1, dtype=torch.long, device=device))          # label=0
+            gt_masks.append(fg.unsqueeze(0))                                           # (1, H, W)
+
     return {"labels": gt_labels, "masks": gt_masks}
 
 
@@ -637,44 +627,39 @@ def calculate_dice_score(pred_masks, pred_logits, gt_masks, threshold=0.5):
         dice_score: float [0, 1]，越高越好
     """
     B, Q, H, W = pred_masks.shape
-    
-    # 确保gt_masks是4D
+
+    # 保证 gt_masks 是 (B, 1, H_gt, W_gt)
     if gt_masks.dim() == 3:
         gt_masks = gt_masks.unsqueeze(1)
-    
-    # 选择confidence最高的query
-    foreground_probs = pred_logits.softmax(dim=-1)[..., :-1]  # (B, Q, C) 排除background
-    confidences = foreground_probs.max(dim=-1)[0]  # (B, Q)
-    best_queries = confidences.argmax(dim=1)  # (B,)
-    
-    # 提取最佳预测mask
-    final_masks = torch.stack([
-        pred_masks[b, best_queries[b]] for b in range(B)
-    ])  # (B, H, W)
-    
-    # 上采样到GT尺寸（Mask2Former设计：预测是H/4×W/4，评估需要上采样到原图）
-    # 这是标准做法，不会丧失准确率：
-    # - 训练时用point sampling，不需要全分辨率
-    # - 评估时需要全分辨率计算Dice
-    final_masks = F.interpolate(
-        final_masks.unsqueeze(1),  # (B, 1, H, W)
-        size=gt_masks.shape[-2:],   # (gt_H, gt_W)
-        mode='bilinear',
-        align_corners=False
-    ).squeeze(1)  # (B, gt_H, gt_W)
-    
+
+    # 分类 softmax，前景类 index=0（因为 num_classes=1）
+    cls_prob = pred_logits.softmax(dim=-1)[..., 0]          # (B, Q)
+
+    # mask 概率
+    mask_prob = pred_masks.sigmoid()                        # (B, Q, H, W)
+
+    # 用分类概率加权 mask，再对 query 做 max 聚合（类似「最可信的前景像素」）
+    combined = (cls_prob.unsqueeze(-1).unsqueeze(-1) * mask_prob)  # (B, Q, H, W)
+    combined_max, _ = combined.max(dim=1)                          # (B, H, W)
+
+    # resize 到 GT 尺寸
+    gt_H, gt_W = gt_masks.shape[-2], gt_masks.shape[-1]
+    if combined_max.shape[-2:] != (gt_H, gt_W):
+        combined_max = F.interpolate(
+            combined_max.unsqueeze(1),
+            size=(gt_H, gt_W),
+            mode='bilinear',
+            align_corners=False
+        ).squeeze(1)
+
     # 二值化
-    pred_binary = (final_masks.sigmoid() > threshold).float()  # (B, gt_H, gt_W)
-    gt_binary = (gt_masks.squeeze(1) > 0).float()  # (B, gt_H, gt_W)
-    
-    # 计算Dice Score: 2 * |A∩B| / (|A| + |B|)
-    intersection = (pred_binary * gt_binary).sum(dim=[1, 2])  # (B,)
-    union = pred_binary.sum(dim=[1, 2]) + gt_binary.sum(dim=[1, 2])  # (B,)
-    
-    # 避免除零
-    dice = (2 * intersection + 1e-6) / (union + 1e-6)  # (B,)
-    
-    # 返回batch平均值
+    pred_binary = (combined_max > threshold).float()        # (B, gt_H, gt_W)
+    gt_binary = (gt_masks.squeeze(1) > 0).float()           # (B, gt_H, gt_W)
+
+    intersection = (pred_binary * gt_binary).sum(dim=[1, 2])
+    union = pred_binary.sum(dim=[1, 2]) + gt_binary.sum(dim=[1, 2])
+
+    dice = (2 * intersection + 1e-6) / (union + 1e-6)
     return dice.mean().item()
 
 
