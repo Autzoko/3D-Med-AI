@@ -707,19 +707,16 @@ def main(args):
         model = segmamba_mask2former_tiny(
             num_classes=args.num_classes,
             num_queries=args.num_queries,
-            in_chans=1,
         )
     elif args.model_size == 'small':
         model = segmamba_mask2former_small(
             num_classes=args.num_classes,
             num_queries=args.num_queries,
-            in_chans=1,
         )
     elif args.model_size == 'base':
         model = segmamba_mask2former_base(
             num_classes=args.num_classes,
             num_queries=args.num_queries,
-            in_chans=1,
         )
     else:
         raise ValueError(f"Unknown model size: {args.model_size}")
