@@ -365,41 +365,50 @@ class SetCriterion(nn.Module):
 # Helper Functions
 # ============================================================================
 
-def prepare_targets(batch: Dict) -> Dict:
-    """
-    Convert semantic masks to instance format
-    """
+def prepare_targets(batch: Dict, num_classes: int) -> Dict:
     masks = batch['mask']  # (B, H, W)
-    B, H, W = masks.shape
+    batch_size = masks.shape[0]
     device = masks.device
-    
-    labels_list = []
-    masks_list = []
-    
-    for i in range(B):
-        mask = masks[i]
+
+    gt_labels = []
+    gt_masks = []
+
+    for b in range(batch_size):
+        mask = masks[b]  # (H, W)
+
         unique_classes = torch.unique(mask)
-        unique_classes = unique_classes[unique_classes != 0]  # Remove background
-        
+
+        # 1) 去掉背景 + ignore label（比如255）
+        #    假设你没有别的奇怪编码，可以先这么写
+        unique_classes = unique_classes[(unique_classes > 0) & (unique_classes <= num_classes)]
+
         if len(unique_classes) == 0:
-            # No foreground, create dummy target
-            labels_list.append(torch.tensor([0], dtype=torch.long, device=device))
-            masks_list.append(torch.zeros((1, H, W), dtype=torch.float32, device=device))
+            # 没有前景 → 我建议：直接返回空，而不是 dummy 0
+            gt_labels.append(torch.empty(0, dtype=torch.long, device=device))
+            gt_masks.append(torch.empty(0, *mask.shape, dtype=torch.bool, device=device))
+            continue
+
+        instance_masks = []
+        instance_labels = []
+        for class_id in unique_classes:
+            class_id = int(class_id.item())
+
+            # 安全检查：防止 class_id > num_classes
+            if class_id < 1 or class_id > num_classes:
+                continue
+
+            instance_mask = (mask == class_id)
+            instance_masks.append(instance_mask)
+            instance_labels.append(class_id - 1)  # 0-indexed in [0, num_classes-1]
+
+        if len(instance_masks) == 0:
+            gt_labels.append(torch.empty(0, dtype=torch.long, device=device))
+            gt_masks.append(torch.empty(0, *mask.shape, dtype=torch.bool, device=device))
         else:
-            instance_masks = []
-            instance_labels = []
-            for cls in unique_classes:
-                binary_mask = (mask == cls).float()
-                instance_masks.append(binary_mask)
-                instance_labels.append(cls.item() - 1)  # 0-indexed for model
-            
-            labels_list.append(torch.tensor(instance_labels, dtype=torch.long, device=device))
-            masks_list.append(torch.stack(instance_masks))
-    
-    return {
-        "labels": labels_list,
-        "masks": masks_list,
-    }
+            gt_masks.append(torch.stack(instance_masks, dim=0))  # (N, H, W)
+            gt_labels.append(torch.tensor(instance_labels, dtype=torch.long, device=device))
+
+    return {"labels": gt_labels, "masks": gt_masks}
 
 
 @torch.no_grad()
@@ -475,7 +484,7 @@ def train_one_epoch(
         masks = batch['mask'].to(device)
         
         # Prepare targets
-        targets = prepare_targets({'mask': masks})
+        targets = prepare_targets(batch, num_classes=1)
         
         # Forward
         outputs = model(images)
