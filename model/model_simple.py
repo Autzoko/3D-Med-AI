@@ -49,25 +49,37 @@ class SegMamba2DSimple(nn.Module):
         self.backbone_name = backbone_name
         self.num_classes = num_classes
         
-        # Backbone维度映射
-        backbone_dims = {
-            'tiny': [48, 96, 192, 384],
-            'small': [48, 96, 192, 384],
-            'base': [64, 128, 256, 512],
+        # Backbone配置映射
+        backbone_configs = {
+            'tiny': {
+                'depths': [2, 2, 2, 2],
+                'dims': [48, 96, 192, 384],
+            },
+            'small': {
+                'depths': [2, 2, 4, 2],
+                'dims': [48, 96, 192, 384],
+            },
+            'base': {
+                'depths': [2, 2, 8, 2],
+                'dims': [64, 128, 256, 512],
+            },
         }
         
-        if backbone_name not in backbone_dims:
+        if backbone_name not in backbone_configs:
             raise ValueError(f"Unknown backbone: {backbone_name}")
         
-        encoder_dims = backbone_dims[backbone_name]
+        config = backbone_configs[backbone_name]
+        encoder_dims = config['dims']
         
         print(f"[SegMamba2DSimple] Creating {backbone_name} model...")
         
         # 1. Backbone
         self.backbone = SegMambaBackbone2D(
-            model_name=backbone_name,
             in_chans=in_chans,
+            depths=config['depths'],
+            dims=config['dims'],
             drop_path_rate=drop_path_rate,
+            return_features='all',
         )
         print(f"  ✓ Backbone: dims={encoder_dims}")
         
