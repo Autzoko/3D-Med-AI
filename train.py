@@ -1,7 +1,7 @@
 """
-SegMamba + Mask2Former 训练脚本 - 最终修复版
+SegMamba + Mask2Former 完整训练脚本 - 索引修复版
 
-修复: Hungarian Matcher索引越界 (完全重写)
+只修复索引越界问题，保持原始所有结构
 """
 
 import argparse
@@ -14,7 +14,7 @@ import torch.nn as nn
 import torch.nn.functional as F
 from torch.utils.data import DataLoader
 from torch.optim import AdamW
-from torch.optim.lr_scheduler import OneCycleLR
+from torch.optim.lr_scheduler import CosineAnnealingLR, OneCycleLR
 from tqdm import tqdm
 from typing import Dict, List, Tuple
 from scipy.optimize import linear_sum_assignment
@@ -24,11 +24,11 @@ from data.dataloader import NPYSegmentationDataset, get_default_transforms
 
 
 # ============================================================================
-# Hungarian Matcher - 完全重写，避免索引问题
+# Hungarian Matcher (只修复索引问题)
 # ============================================================================
 
 class HungarianMatcher(nn.Module):
-    """Hungarian Matcher - 安全版本"""
+    """Hungarian Matcher - 修复索引越界"""
     
     def __init__(
         self,
@@ -45,89 +45,72 @@ class HungarianMatcher(nn.Module):
     
     @torch.no_grad()
     def forward(self, outputs, targets):
-        bs, num_queries = outputs["pred_logits"].shape[:2]
+        bs = outputs["pred_logits"].shape[0]
         
-        # 不使用flatten，逐batch处理
+        # Flatten
+        out_prob = outputs["pred_logits"].flatten(0, 1).softmax(-1)  # (B*Q, C+1)
+        out_mask = outputs["pred_masks"].flatten(0, 1)  # (B*Q, H, W)
+        
+        # Concatenate targets
+        tgt_ids = torch.cat([v for v in targets["labels"]])
+        tgt_mask = torch.cat([v for v in targets["masks"]])
+        
+        # 🔧 修复1: 确保tgt_ids类型正确且在有效范围内
+        num_classes = out_prob.shape[-1] - 1  # C (不包含background)
+        tgt_ids = tgt_ids.long()  # 确保是long类型
+        tgt_ids = torch.clamp(tgt_ids, 0, num_classes)  # 限制范围 [0, num_classes]
+        
+        # 1. Classification cost - 🔧 使用gather避免索引错误
+        # 原来: cost_class = -out_prob[:, tgt_ids]  这会出错！
+        # 正确做法: 使用gather
+        tgt_ids_expanded = tgt_ids.unsqueeze(0).expand(out_prob.shape[0], -1)  # (B*Q, N)
+        cost_class = -torch.gather(out_prob, 1, tgt_ids_expanded)  # (B*Q, N)
+        
+        # 2. Mask cost (point sampling)
+        out_mask_flat = out_mask.flatten(1)  # (B*Q, H*W)
+        tgt_mask_flat = tgt_mask.flatten(1).float()  # (N, H*W)
+        
+        num_points = min(self.num_points, out_mask_flat.shape[1])
+        point_idx = torch.randperm(out_mask_flat.shape[1], device=out_mask.device)[:num_points]
+        
+        out_mask_sampled = out_mask_flat[:, point_idx].sigmoid()  # (B*Q, P)
+        tgt_mask_sampled = tgt_mask_flat[:, point_idx]  # (N, P)
+        
+        # 🔧 修复2: 安全的BCE计算
+        with torch.no_grad():
+            cost_mask = F.binary_cross_entropy_with_logits(
+                out_mask_flat[:, point_idx].unsqueeze(1).expand(-1, tgt_mask_sampled.shape[0], -1),
+                tgt_mask_sampled.unsqueeze(0).expand(out_mask_sampled.shape[0], -1, -1),
+                reduction='none'
+            ).mean(-1)
+        
+        # 3. Dice cost
+        numerator = 2 * (out_mask_sampled.unsqueeze(1) * tgt_mask_sampled.unsqueeze(0)).sum(-1)
+        denominator = out_mask_sampled.unsqueeze(1).sum(-1) + tgt_mask_sampled.unsqueeze(0).sum(-1)
+        cost_dice = 1 - (numerator + 1) / (denominator + 1)
+        
+        # Final cost
+        C = self.cost_class * cost_class + self.cost_mask * cost_mask + self.cost_dice * cost_dice
+        C = C.view(bs, -1, tgt_mask.shape[0]).cpu()
+        
+        # Hungarian matching
+        sizes = [len(v) for v in targets["labels"]]
         indices = []
-        
-        for i in range(bs):
-            # 当前batch的预测
-            out_prob = outputs["pred_logits"][i].softmax(-1)  # (Q, C+1)
-            out_mask = outputs["pred_masks"][i]  # (Q, H, W)
-            
-            # 当前batch的GT
-            tgt_ids = targets["labels"][i]  # (N,)
-            tgt_mask = targets["masks"][i]  # (N, H, W)
-            
-            num_tgt = len(tgt_ids)
-            
-            # 如果没有target，返回空匹配
-            if num_tgt == 0:
-                indices.append((
-                    torch.tensor([], dtype=torch.long),
-                    torch.tensor([], dtype=torch.long)
-                ))
+        offset = 0
+        for i, size in enumerate(sizes):
+            if size == 0:
+                indices.append((torch.tensor([], dtype=torch.long), torch.tensor([], dtype=torch.long)))
                 continue
-            
-            # 1. Classification cost - 安全版本
-            # 确保tgt_ids在有效范围内
-            num_classes = out_prob.shape[-1] - 1
-            tgt_ids_safe = torch.clamp(tgt_ids, 0, num_classes).long()
-            
-            # 使用gather避免索引问题
-            cost_class = -out_prob[:, tgt_ids_safe]  # (Q, N)
-            
-            # 2. Mask cost
-            out_mask_flat = out_mask.flatten(1)  # (Q, H*W)
-            tgt_mask_flat = tgt_mask.flatten(1).float()  # (N, H*W)
-            
-            # Point sampling
-            H, W = out_mask.shape[-2:]
-            num_points = min(self.num_points, H * W)
-            point_idx = torch.randperm(H * W, device=out_mask.device)[:num_points]
-            
-            out_mask_sampled = out_mask_flat[:, point_idx]  # (Q, P)
-            tgt_mask_sampled = tgt_mask_flat[:, point_idx]  # (N, P)
-            
-            # Mask BCE cost - 安全计算
-            out_mask_sampled_sig = out_mask_sampled.sigmoid()
-            cost_mask = []
-            for n in range(num_tgt):
-                # 计算每个query与第n个target的BCE
-                bce = F.binary_cross_entropy(
-                    out_mask_sampled_sig,
-                    tgt_mask_sampled[n:n+1].expand(num_queries, -1),
-                    reduction='none'
-                ).mean(dim=1)  # (Q,)
-                cost_mask.append(bce)
-            cost_mask = torch.stack(cost_mask, dim=1)  # (Q, N)
-            
-            # 3. Dice cost
-            numerator = 2 * (out_mask_sampled_sig.unsqueeze(1) * tgt_mask_sampled.unsqueeze(0)).sum(-1)
-            denominator = out_mask_sampled_sig.unsqueeze(1).sum(-1) + tgt_mask_sampled.unsqueeze(0).sum(-1) + 1e-4
-            cost_dice = 1 - numerator / denominator  # (Q, N)
-            
-            # Final cost
-            C = (
-                self.cost_class * cost_class +
-                self.cost_mask * cost_mask +
-                self.cost_dice * cost_dice
-            )
-            
-            # Hungarian matching
-            C_cpu = C.cpu().numpy()
-            src_idx, tgt_idx = linear_sum_assignment(C_cpu)
-            
-            indices.append((
-                torch.as_tensor(src_idx, dtype=torch.long),
-                torch.as_tensor(tgt_idx, dtype=torch.long)
-            ))
+            c = C[i, :, offset:offset+size]
+            src_idx, tgt_idx = linear_sum_assignment(c)
+            indices.append((torch.as_tensor(src_idx, dtype=torch.long), torch.as_tensor(tgt_idx, dtype=torch.long)))
+            offset += size
         
         return indices
 
 
 # ============================================================================
-# SetCriterion
+# Set Criterion (保持原样)
 # ============================================================================
 
 class SetCriterion(nn.Module):
@@ -168,9 +151,9 @@ class SetCriterion(nn.Module):
         
         for batch_idx, (src_idx, tgt_idx) in enumerate(indices):
             if len(src_idx) > 0:
-                # 确保索引安全
+                # 🔧 确保标签在有效范围内
                 tgt_labels = targets["labels"][batch_idx][tgt_idx]
-                tgt_labels = torch.clamp(tgt_labels, 0, self.num_classes).long()
+                tgt_labels = torch.clamp(tgt_labels.long(), 0, self.num_classes)
                 target_classes[batch_idx, src_idx] = tgt_labels
         
         loss_ce = F.cross_entropy(
@@ -219,11 +202,8 @@ class SetCriterion(nn.Module):
             shift = num_uncertain_points * torch.arange(src_masks_points.shape[0], dtype=torch.long, device=src_masks.device)
             idx += shift.unsqueeze(1)
             
-            src_masks_points_flat = src_masks_points.squeeze(1).flatten(0, 1)
-            target_masks_points_flat = target_masks_points.squeeze(1).flatten(0, 1)
-            
-            src_masks_points = src_masks_points_flat[idx].view(-1, num_uncertain_points)
-            target_masks_points = target_masks_points_flat[idx].view(-1, num_uncertain_points)
+            src_masks_points = src_masks_points.squeeze(1).flatten(0, 1)[idx].view(-1, num_uncertain_points)
+            target_masks_points = target_masks_points.squeeze(1).flatten(0, 1)[idx].view(-1, num_uncertain_points)
             
             point_coords_rand = torch.rand(src_masks.shape[0], num_random_points, 2, device=src_masks.device)
             src_masks_points_rand = self._sample_points(src_masks.unsqueeze(1), point_coords_rand).squeeze(1)
@@ -280,7 +260,7 @@ class SetCriterion(nn.Module):
 
 
 # ============================================================================
-# Training/Validation
+# Training/Validation (保持原样)
 # ============================================================================
 
 def calculate_dice_score(pred_masks, gt_masks):
@@ -432,7 +412,7 @@ def validate(model, dataloader, criterion, device):
 # ============================================================================
 
 def main():
-    parser = argparse.ArgumentParser(description='SegMamba + Mask2Former Training')
+    parser = argparse.ArgumentParser(description='SegMamba + Mask2Former Training - Fixed')
     
     parser.add_argument('--data_root', type=str, required=True)
     parser.add_argument('--image_size', type=int, default=256)
@@ -441,6 +421,7 @@ def main():
     parser.add_argument('--model_size', type=str, default='small', choices=['tiny', 'small', 'base'])
     parser.add_argument('--num_queries', type=int, default=20)
     
+    # 新增参数
     parser.add_argument('--drop_path_rate', type=float, default=0.0)
     parser.add_argument('--use_skip_connections', action='store_true')
     
