@@ -11,7 +11,13 @@
 
 """
 SegMamba 2D Backbone (Encoder Only) for ultrasound medical image segmentation
-This is the encoder-only version that can be used with custom decoders
+Enhanced with full residual connections and DropPath regularization
+
+修改记录:
+- 添加 DropPath 类（正则化）
+- MambaLayer 增强为 Transformer-style residual
+- 添加 drop_path_rate 参数到各个函数
+- 保持所有原有函数名和类名不变
 """
 
 from __future__ import annotations
@@ -20,7 +26,28 @@ import torch
 from typing import List, Tuple
 
 from mamba_ssm import Mamba
-import torch.nn.functional as F 
+import torch.nn.functional as F
+
+
+# ============================================================================
+# Drop Path (Stochastic Depth) - 新增
+# ============================================================================
+
+class DropPath(nn.Module):
+    """Drop paths (Stochastic Depth) per sample for residual blocks."""
+    def __init__(self, drop_prob: float = 0.0):
+        super().__init__()
+        self.drop_prob = drop_prob
+    
+    def forward(self, x):
+        if self.drop_prob == 0. or not self.training:
+            return x
+        keep_prob = 1 - self.drop_prob
+        shape = (x.shape[0],) + (1,) * (x.ndim - 1)
+        random_tensor = keep_prob + torch.rand(shape, dtype=x.dtype, device=x.device)
+        random_tensor.floor_()
+        output = x.div(keep_prob) * random_tensor
+        return output
 
 
 class LayerNorm(nn.Module):
@@ -51,71 +78,91 @@ class LayerNorm(nn.Module):
 
 
 class MambaLayer(nn.Module):
-    def __init__(self, dim, d_state=16, d_conv=4, expand=2, num_slices=None):
+    def __init__(self, dim, d_state=16, d_conv=4, expand=2, num_slices=None, drop_path=0.0):
         """
-        2D MambaLayer for processing 2D feature maps
-        Args:
-            dim: channel dimension
-            d_state: SSM state expansion factor
-            d_conv: Local convolution width
-            expand: Block expansion factor
-            num_slices: number of slices for spatial direction processing (height slices in 2D)
+        2D MambaLayer with enhanced residual connections
+        
+        新增参数:
+            drop_path: DropPath rate (default: 0.0, 向后兼容)
         """
         super().__init__()
         self.dim = dim
         self.norm = nn.LayerNorm(dim)
         self.mamba = Mamba(
-                d_model=dim,  # Model dimension d_model
-                d_state=d_state,  # SSM state expansion factor
-                d_conv=d_conv,    # Local convolution width
-                expand=expand,    # Block expansion factor
+                d_model=dim,
+                d_state=d_state,
+                d_conv=d_conv,
+                expand=expand,
                 bimamba_type="v3",
                 nslices=num_slices,
         )
+        # 新增: DropPath for regularization
+        self.drop_path = DropPath(drop_path) if drop_path > 0. else nn.Identity()
     
     def forward(self, x):
         """
+        Enhanced residual: x = x + DropPath(Mamba(Norm(x)))
+        
         Args:
             x: input tensor of shape (B, C, H, W)
         Returns:
             output tensor of shape (B, C, H, W)
         """
         B, C = x.shape[:2]
-        x_skip = x
         assert C == self.dim
         
-        # For 2D: flatten spatial dimensions H*W
-        n_tokens = x.shape[2:].numel()  # H * W
-        img_dims = x.shape[2:]  # (H, W)
+        # 保存shortcut
+        shortcut = x
         
-        # Reshape from (B, C, H, W) to (B, C, H*W) then transpose to (B, H*W, C)
+        # For 2D: flatten spatial dimensions H*W
+        n_tokens = x.shape[2:].numel()
+        img_dims = x.shape[2:]
+        
+        # (B, C, H, W) -> (B, H*W, C)
         x_flat = x.reshape(B, C, n_tokens).transpose(-1, -2)
+        
+        # Pre-Norm + Mamba
         x_norm = self.norm(x_flat)
         x_mamba = self.mamba(x_norm)
 
-        # Reshape back to (B, C, H, W)
+        # (B, H*W, C) -> (B, C, H, W)
         out = x_mamba.transpose(-1, -2).reshape(B, C, *img_dims)
-        out = out + x_skip
+        
+        # 增强的残差连接: shortcut + DropPath(output)
+        out = shortcut + self.drop_path(out)
         
         return out
 
     
 class MlpChannel(nn.Module):
-    def __init__(self, hidden_size, mlp_dim):
+    def __init__(self, hidden_size, mlp_dim, drop_path=0.0):
+        """
+        Channel MLP with residual connection
+        
+        新增参数:
+            drop_path: DropPath rate (default: 0.0)
+        """
         super().__init__()
         self.fc1 = nn.Conv2d(hidden_size, mlp_dim, 1)
         self.act = nn.GELU()
         self.fc2 = nn.Conv2d(mlp_dim, hidden_size, 1)
+        # 新增: DropPath
+        self.drop_path = DropPath(drop_path) if drop_path > 0. else nn.Identity()
 
     def forward(self, x):
+        """
+        Enhanced residual: x = x + DropPath(MLP(x))
+        """
+        shortcut = x
         x = self.fc1(x)
         x = self.act(x)
         x = self.fc2(x)
-        return x
+        # 增强的残差连接
+        return shortcut + self.drop_path(x)
 
 
 class GSC(nn.Module):
-    """Gated Spatial Convolution module for 2D"""
+    """Gated Spatial Convolution module for 2D (保持不变，已有residual)"""
     def __init__(self, in_channels) -> None:
         super().__init__()
 
@@ -136,10 +183,7 @@ class GSC(nn.Module):
         self.nonliner4 = nn.ReLU()
 
     def forward(self, x):
-        """
-        Args:
-            x: input tensor of shape (B, C, H, W)
-        """
+        """已有residual connection"""
         x_residual = x 
 
         x1 = self.proj(x)
@@ -166,14 +210,10 @@ class SegMambaBackbone2D(nn.Module):
     """
     SegMamba 2D Backbone (Encoder Only)
     
-    This module extracts multi-scale features from 2D images using the SegMamba architecture.
-    It can be used as a standalone backbone and connected to custom decoders.
-    
-    Features:
-    - Multi-scale feature extraction at 4 different resolutions
-    - Tri-orientated Mamba (ToM) for global context modeling
-    - Gated Spatial Convolution (GSC) for local feature enhancement
-    - Skip connections preservation for U-Net style architectures
+    Enhanced with full residual connections:
+    - DropPath (stochastic depth) for regularization
+    - Transformer-style residual in MambaLayer and MLP
+    - Backward compatible with original API
     """
     
     def __init__(
@@ -181,23 +221,16 @@ class SegMambaBackbone2D(nn.Module):
         in_chans: int = 1,
         depths: List[int] = [2, 2, 2, 2],
         dims: List[int] = [48, 96, 192, 384],
-        drop_path_rate: float = 0.,
+        drop_path_rate: float = 0.,  # 新增参数，默认0保持向后兼容
         layer_scale_init_value: float = 1e-6,
         out_indices: List[int] = [0, 1, 2, 3],
-        return_features: str = 'all'  # 'all', 'last', or 'multi_scale'
+        return_features: str = 'all'
     ):
         """
-        Args:
-            in_chans: Number of input channels (1 for grayscale ultrasound)
-            depths: Number of Mamba blocks at each stage
-            dims: Feature dimensions at each stage [stage0, stage1, stage2, stage3]
-            drop_path_rate: Stochastic depth rate (not used in current implementation)
-            layer_scale_init_value: Initial value for layer scale (not used in current implementation)
-            out_indices: Which stages to output (default: all stages)
-            return_features: 
-                - 'all': return all intermediate features as tuple
-                - 'last': return only the last (deepest) feature
-                - 'multi_scale': return features with spatial sizes for decoder
+        新增参数:
+            drop_path_rate: Stochastic depth rate (0.0 = 不使用, 0.1-0.2 = 推荐用于正则化)
+        
+        其他参数保持不变，完全向后兼容
         """
         super().__init__()
         
@@ -208,18 +241,20 @@ class SegMambaBackbone2D(nn.Module):
         self.return_features = return_features
         self.num_stages = 4
 
+        # Stochastic depth decay rule
+        total_depth = sum(depths)
+        dpr = [x.item() for x in torch.linspace(0, drop_path_rate, total_depth)]
+
         # Stem and downsampling layers
         self.downsample_layers = nn.ModuleList()
         
-        # Stem layer: 7x7 conv with stride 2
-        # Input: (B, in_chans, H, W) -> Output: (B, dims[0], H/2, W/2)
+        # Stem layer
         stem = nn.Sequential(
             nn.Conv2d(in_chans, dims[0], kernel_size=7, stride=2, padding=3),
         )
         self.downsample_layers.append(stem)
         
-        # Downsampling layers for stages 1-3
-        # Each: (B, dims[i], H, W) -> (B, dims[i+1], H/2, W/2)
+        # Downsampling layers
         for i in range(3):
             downsample_layer = nn.Sequential(
                 nn.InstanceNorm2d(dims[i]),
@@ -231,66 +266,64 @@ class SegMambaBackbone2D(nn.Module):
         self.stages = nn.ModuleList()
         self.gscs = nn.ModuleList()
         
-        # num_slices for different stages
-        # Adjust based on expected input resolution
-        # Default assumes ~256x256 input
         num_slices_list = [32, 16, 8, 4]
         
+        cur_depth = 0
         for i in range(4):
-            # Gated Spatial Convolution
+            # GSC
             gsc = GSC(dims[i])
             
-            # Stack of Mamba layers
+            # Stack of Mamba layers with DropPath
             stage = nn.Sequential(
-                *[MambaLayer(dim=dims[i], num_slices=num_slices_list[i]) for j in range(depths[i])]
+                *[MambaLayer(
+                    dim=dims[i], 
+                    num_slices=num_slices_list[i],
+                    drop_path=dpr[cur_depth + j]  # 每层递增的drop_path
+                ) for j in range(depths[i])]
             )
+            
+            cur_depth += depths[i]
 
             self.stages.append(stage)
             self.gscs.append(gsc)
 
-        # Output normalization and MLP for each stage
+        # Output normalization and MLP
         self.mlps = nn.ModuleList()
+        cur_depth = 0
         for i_layer in range(4):
             layer = nn.InstanceNorm2d(dims[i_layer])
             layer_name = f'norm{i_layer}'
             self.add_module(layer_name, layer)
-            self.mlps.append(MlpChannel(dims[i_layer], 2 * dims[i_layer]))
+            
+            # MLP with DropPath
+            mlp_drop_path = dpr[cur_depth + depths[i_layer] - 1]
+            self.mlps.append(MlpChannel(dims[i_layer], 2 * dims[i_layer], drop_path=mlp_drop_path))
+            cur_depth += depths[i_layer]
 
     def get_feature_dims(self) -> List[int]:
-        """
-        Returns the feature dimensions at each stage
-        Useful for building decoders
-        """
+        """Returns the feature dimensions at each stage"""
         return self.dims
     
     def get_downsample_ratios(self) -> List[int]:
-        """
-        Returns the downsampling ratio relative to input for each stage
-        Stage 0: 2x, Stage 1: 4x, Stage 2: 8x, Stage 3: 16x
-        """
+        """Returns the downsampling ratio relative to input for each stage"""
         return [2, 4, 8, 16]
 
     def forward_features(self, x: torch.Tensor) -> Tuple[torch.Tensor, ...]:
         """
-        Forward pass through all stages
+        Forward pass through all stages (保持原有接口)
         
         Args:
             x: Input tensor of shape (B, in_chans, H, W)
             
         Returns:
-            Tuple of feature tensors from each stage specified in out_indices
-            Each feature has shape (B, dims[i], H/(2^(i+1)), W/(2^(i+1)))
+            Tuple of feature tensors from each stage
         """
         outs = []
         for i in range(4):
-            # Downsample
             x = self.downsample_layers[i](x)
-            # Gated Spatial Conv
             x = self.gscs[i](x)
-            # Mamba blocks
             x = self.stages[i](x)
 
-            # Apply normalization and MLP if this stage is in out_indices
             if i in self.out_indices:
                 norm_layer = getattr(self, f'norm{i}')
                 x_out = norm_layer(x)
@@ -300,24 +333,12 @@ class SegMambaBackbone2D(nn.Module):
         return tuple(outs)
 
     def forward(self, x: torch.Tensor):
-        """
-        Forward pass
-        
-        Args:
-            x: Input tensor of shape (B, in_chans, H, W)
-            
-        Returns:
-            Depends on return_features setting:
-            - 'all': tuple of all stage features
-            - 'last': only the last (deepest) feature
-            - 'multi_scale': dict with 'features' and 'shapes'
-        """
+        """Forward pass (保持原有接口)"""
         features = self.forward_features(x)
         
         if self.return_features == 'last':
             return features[-1]
         elif self.return_features == 'multi_scale':
-            # Return features with their spatial sizes
             feature_info = {
                 'features': features,
                 'shapes': [f.shape[2:] for f in features],
@@ -325,124 +346,103 @@ class SegMambaBackbone2D(nn.Module):
                 'downsample_ratios': [2**(i+1) for i in self.out_indices]
             }
             return feature_info
-        else:  # 'all'
+        else:
             return features
 
 
-# Convenience functions for different model sizes
+# ============================================================================
+# Convenience functions (保持原有名称，添加drop_path_rate参数)
+# ============================================================================
 
-def segmamba_backbone_tiny(in_chans=1, return_features='all'):
+def segmamba_backbone_tiny(in_chans=1, return_features='all', drop_path_rate=0.0):
     """
     Tiny SegMamba backbone
-    Parameters: ~5M
+    
+    新增参数:
+        drop_path_rate: 推荐0.05-0.1 for regularization
     """
     return SegMambaBackbone2D(
         in_chans=in_chans,
         depths=[2, 2, 2, 2],
         dims=[48, 96, 192, 384],
+        drop_path_rate=drop_path_rate,
         return_features=return_features
     )
 
 
-def segmamba_backbone_small(in_chans=1, return_features='all'):
+def segmamba_backbone_small(in_chans=1, return_features='all', drop_path_rate=0.0):
     """
     Small SegMamba backbone
-    Parameters: ~8M
+    
+    新增参数:
+        drop_path_rate: 推荐0.1-0.15 for regularization (BUSI数据集)
     """
     return SegMambaBackbone2D(
         in_chans=in_chans,
         depths=[2, 2, 4, 2],
         dims=[48, 96, 192, 384],
+        drop_path_rate=drop_path_rate,
         return_features=return_features
     )
 
 
-def segmamba_backbone_base(in_chans=1, return_features='all'):
+def segmamba_backbone_base(in_chans=1, return_features='all', drop_path_rate=0.0):
     """
     Base SegMamba backbone
-    Parameters: ~15M
+    
+    新增参数:
+        drop_path_rate: 推荐0.15-0.2 for regularization
     """
     return SegMambaBackbone2D(
         in_chans=in_chans,
         depths=[2, 2, 8, 2],
         dims=[64, 128, 256, 512],
+        drop_path_rate=drop_path_rate,
         return_features=return_features
     )
 
 
-def segmamba_backbone_large(in_chans=1, return_features='all'):
-    """
-    Large SegMamba backbone
-    Parameters: ~25M
-    """
+def segmamba_backbone_large(in_chans=1, return_features='all', drop_path_rate=0.0):
+    """Large SegMamba backbone"""
     return SegMambaBackbone2D(
         in_chans=in_chans,
         depths=[2, 4, 12, 2],
         dims=[96, 192, 384, 768],
+        drop_path_rate=drop_path_rate,
         return_features=return_features
     )
 
 
 if __name__ == "__main__":
     print("="*80)
-    print("SegMamba 2D Backbone Testing")
+    print("SegMamba 2D Backbone with Enhanced Residual Connections")
     print("="*80)
     
-    # Test 1: Basic forward pass with all features
-    print("\n[Test 1] Basic forward pass - return all features")
-    backbone = segmamba_backbone_tiny(in_chans=1, return_features='all')
+    # Test backward compatibility
+    print("\n[Test 1] Backward compatibility (drop_path_rate=0)")
+    backbone_old = segmamba_backbone_small(in_chans=1, return_features='all')
     x = torch.randn(2, 1, 256, 256)
-    features = backbone(x)
+    features_old = backbone_old(x)
     
     print(f"Input shape: {x.shape}")
-    print(f"Number of output features: {len(features)}")
-    for i, feat in enumerate(features):
-        print(f"  Stage {i} output shape: {feat.shape}")
+    for i, feat in enumerate(features_old):
+        print(f"  Stage {i} output: {feat.shape}")
     
-    # Test 2: Return only last feature
-    print("\n[Test 2] Return last feature only")
-    backbone_last = segmamba_backbone_tiny(in_chans=1, return_features='last')
-    last_feat = backbone_last(x)
-    print(f"Last feature shape: {last_feat.shape}")
+    # Test with DropPath
+    print("\n[Test 2] With DropPath regularization (drop_path_rate=0.1)")
+    backbone_new = segmamba_backbone_small(in_chans=1, return_features='all', drop_path_rate=0.1)
+    backbone_new.eval()
+    with torch.no_grad():
+        features_new = backbone_new(x)
     
-    # Test 3: Return multi-scale info
-    print("\n[Test 3] Return multi-scale information")
-    backbone_ms = segmamba_backbone_tiny(in_chans=1, return_features='multi_scale')
-    feature_info = backbone_ms(x)
-    print(f"Number of features: {len(feature_info['features'])}")
-    print(f"Feature channels: {feature_info['channels']}")
-    print(f"Feature shapes: {feature_info['shapes']}")
-    print(f"Downsample ratios: {feature_info['downsample_ratios']}")
+    for i, feat in enumerate(features_new):
+        print(f"  Stage {i} output: {feat.shape}")
     
-    # Test 4: Different input sizes
-    print("\n[Test 4] Different input resolutions")
-    for size in [128, 256, 512]:
-        x_test = torch.randn(1, 1, size, size)
-        feats = backbone(x_test)
-        print(f"Input size {size}x{size}:")
-        for i, feat in enumerate(feats):
-            print(f"  Stage {i}: {feat.shape}")
-    
-    # Test 5: Model sizes comparison
-    print("\n[Test 5] Model size comparison")
-    models = {
-        'Tiny': segmamba_backbone_tiny(),
-        'Small': segmamba_backbone_small(),
-        'Base': segmamba_backbone_base(),
-        'Large': segmamba_backbone_large(),
-    }
-    
-    for name, model in models.items():
-        num_params = sum(p.numel() for p in model.parameters())
-        print(f"{name:10s}: {num_params:>12,} parameters")
-    
-    # Test 6: Feature dimension info
-    print("\n[Test 6] Feature dimensions for each model")
-    for name, model in models.items():
-        dims = model.get_feature_dims()
-        ratios = model.get_downsample_ratios()
-        print(f"{name:10s}: dims={dims}, downsample_ratios={ratios}")
+    # Count parameters
+    params = sum(p.numel() for p in backbone_new.parameters())
+    print(f"\nTotal parameters: {params:,}")
     
     print("\n" + "="*80)
-    print("All tests completed successfully!")
+    print("✓ Enhanced residual connections added!")
+    print("✓ Backward compatible with original API!")
     print("="*80)

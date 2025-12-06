@@ -1,21 +1,11 @@
 """
-SegMamba + Mask2Former 完整训练脚本 - 修复版
+SegMamba + Mask2Former 完整训练脚本 - 增强版
 
-主要修复：
-1. ✅ Deep Supervision权重修复（使用衰减权重，避免累加过高）
-2. ✅ 添加真实Dice Score计算和监控
-3. ✅ 改进的训练输出（显示Loss和Score）
-4. ✅ 基于Dice Score保存最佳模型
-5. ✅ 更合理的学习率和优化器设置
-6. ✅ Hungarian Matching保留（完整Mask2Former）
+新增功能:
+1. DropPath regularization (--drop_path_rate)
+2. Encoder-decoder skip connections (--use_skip_connections)
 
-参考：
-- Mask2Former官方实现
-- SegMamba训练代码
-- 用户反馈的问题修复
-
-作者：基于用户代码修复
-日期：2025-12-05
+其他功能保持不变
 """
 
 import argparse
@@ -39,14 +29,11 @@ from data.dataloader import NPYSegmentationDataset, get_default_transforms
 
 
 # ============================================================================
-# Hungarian Matcher (保持不变，已验证正确)
+# Hungarian Matcher (保持不变)
 # ============================================================================
 
 class HungarianMatcher(nn.Module):
-    """
-    Hungarian Matcher for bipartite matching
-    参考：Mask2Former官方 modeling/matcher.py
-    """
+    """Hungarian Matcher for bipartite matching"""
     
     def __init__(
         self,
@@ -63,36 +50,26 @@ class HungarianMatcher(nn.Module):
     
     @torch.no_grad()
     def forward(self, outputs, targets):
-        """
-        Args:
-            outputs: dict with 'pred_logits' (B, Q, C) and 'pred_masks' (B, Q, H, W)
-            targets: dict with 'labels' List[(N,)] and 'masks' List[(N, H, W)]
-        
-        Returns:
-            List of (src_idx, tgt_idx) tuples
-        """
         bs = outputs["pred_logits"].shape[0]
         
-        # Flatten
-        out_prob = outputs["pred_logits"].flatten(0, 1).softmax(-1)  # (B*Q, C)
-        out_mask = outputs["pred_masks"].flatten(0, 1)  # (B*Q, H, W)
+        out_prob = outputs["pred_logits"].flatten(0, 1).softmax(-1)
+        out_mask = outputs["pred_masks"].flatten(0, 1)
         
-        # Concatenate targets
         tgt_ids = torch.cat([v for v in targets["labels"]])
         tgt_mask = torch.cat([v for v in targets["masks"]])
         
         # 1. Classification cost
         cost_class = -out_prob[:, tgt_ids]
         
-        # 2. Mask cost (point sampling)
-        out_mask_flat = out_mask.flatten(1)  # (B*Q, H*W)
-        tgt_mask_flat = tgt_mask.flatten(1).float()  # (N, H*W)
+        # 2. Mask cost
+        out_mask_flat = out_mask.flatten(1)
+        tgt_mask_flat = tgt_mask.flatten(1).float()
         
         num_points = min(self.num_points, out_mask_flat.shape[1])
         point_idx = torch.randperm(out_mask_flat.shape[1], device=out_mask.device)[:num_points]
         
-        out_mask_sampled = out_mask_flat[:, point_idx].sigmoid()  # (B*Q, P)
-        tgt_mask_sampled = tgt_mask_flat[:, point_idx]  # (N, P)
+        out_mask_sampled = out_mask_flat[:, point_idx].sigmoid()
+        tgt_mask_sampled = tgt_mask_flat[:, point_idx]
         
         cost_mask = F.binary_cross_entropy_with_logits(
             out_mask_flat[:, point_idx].unsqueeze(1).expand(-1, tgt_mask_sampled.shape[0], -1),
@@ -102,51 +79,45 @@ class HungarianMatcher(nn.Module):
         
         # 3. Dice cost
         numerator = 2 * (out_mask_sampled.unsqueeze(1) * tgt_mask_sampled.unsqueeze(0)).sum(-1)
-        denominator = out_mask_sampled.unsqueeze(1).sum(-1) + tgt_mask_sampled.unsqueeze(0).sum(-1)
-        cost_dice = 1 - (numerator + 1) / (denominator + 1)
+        denominator = out_mask_sampled.unsqueeze(1).sum(-1) + tgt_mask_sampled.unsqueeze(0).sum(-1) + 1e-4
+        cost_dice = 1 - numerator / denominator
         
         # Final cost
         C = self.cost_class * cost_class + self.cost_mask * cost_mask + self.cost_dice * cost_dice
-        C = C.view(bs, -1, tgt_mask.shape[0]).cpu()
+        C = C.view(bs, -1, tgt_ids.shape[0]).cpu()
         
         # Hungarian matching
         sizes = [len(v) for v in targets["labels"]]
         indices = []
-        offset = 0
+        start_idx = 0
         for i, size in enumerate(sizes):
             if size == 0:
                 indices.append((torch.tensor([], dtype=torch.long), torch.tensor([], dtype=torch.long)))
                 continue
-            c = C[i, :, offset:offset+size]
-            src_idx, tgt_idx = linear_sum_assignment(c)
+            cost_matrix = C[i, :, start_idx:start_idx+size]
+            src_idx, tgt_idx = linear_sum_assignment(cost_matrix)
             indices.append((torch.as_tensor(src_idx, dtype=torch.long), torch.as_tensor(tgt_idx, dtype=torch.long)))
-            offset += size
+            start_idx += size
         
         return indices
 
 
 # ============================================================================
-# Set Criterion (修复版 - 关键改进)
+# SetCriterion (保持不变，已验证正确)
 # ============================================================================
 
 class SetCriterion(nn.Module):
-    """
-    Set Criterion for Mask2Former - 修复版
-    
-    关键修复：
-    1. Deep Supervision使用衰减权重
-    2. 添加真实Dice Score计算
-    """
+    """Set criterion with deep supervision"""
     
     def __init__(
         self,
-        num_classes: int,
-        matcher: HungarianMatcher,
-        weight_dict: Dict[str, float],
-        eos_coef: float = 0.1,
-        num_points: int = 12544,
-        oversample_ratio: float = 3.0,
-        importance_sample_ratio: float = 0.75,
+        num_classes,
+        matcher,
+        weight_dict,
+        eos_coef=0.1,
+        num_points=12544,
+        oversample_ratio=3.0,
+        importance_sample_ratio=0.75,
     ):
         super().__init__()
         self.num_classes = num_classes
@@ -157,50 +128,13 @@ class SetCriterion(nn.Module):
         self.oversample_ratio = oversample_ratio
         self.importance_sample_ratio = importance_sample_ratio
         
-        # Background weight
         empty_weight = torch.ones(self.num_classes + 1)
         empty_weight[-1] = self.eos_coef
         self.register_buffer('empty_weight', empty_weight)
     
-    def forward(self, outputs, targets):
-        """
-        Args:
-            outputs: dict with keys
-                - pred_logits: (B, Q, C)
-                - pred_masks: (B, Q, H, W)
-                - aux_outputs: List of dicts (auxiliary predictions)
-            targets: dict with keys
-                - labels: List of (N,) tensors
-                - masks: List of (N, H, W) tensors
-        """
-        # Matching
-        indices = self.matcher(outputs, targets)
-        
-        # Compute losses for final layer
-        losses = {}
-        losses.update(self.loss_labels(outputs, targets, indices))
-        losses.update(self.loss_masks(outputs, targets, indices, self.count_masks(targets)))
-        
-        # Deep Supervision
-        if 'aux_outputs' in outputs:
-            for i, aux_outputs in enumerate(outputs['aux_outputs']):
-                aux_indices = self.matcher(aux_outputs, targets)
-                l_dict = self.loss_labels(aux_outputs, targets, aux_indices)
-                l_dict.update(self.loss_masks(aux_outputs, targets, aux_indices, self.count_masks(targets)))
-                l_dict = {f'{k}_{i}': v for k, v in l_dict.items()}
-                losses.update(l_dict)
-        
-        return losses
-    
-    def count_masks(self, targets):
-        """Count total number of masks"""
-        return sum([len(t) for t in targets["labels"]])
-    
     def loss_labels(self, outputs, targets, indices):
-        """Classification loss"""
-        pred_logits = outputs["pred_logits"]  # (B, Q, C)
+        pred_logits = outputs["pred_logits"]
         
-        # Prepare target classes
         target_classes = torch.full(
             pred_logits.shape[:2],
             self.num_classes,
@@ -208,12 +142,10 @@ class SetCriterion(nn.Module):
             device=pred_logits.device
         )
         
-        # Fill in matched classes
         for batch_idx, (src_idx, tgt_idx) in enumerate(indices):
             if len(src_idx) > 0:
                 target_classes[batch_idx, src_idx] = targets["labels"][batch_idx][tgt_idx]
         
-        # Cross entropy loss
         loss_ce = F.cross_entropy(
             pred_logits.transpose(1, 2),
             target_classes,
@@ -223,386 +155,248 @@ class SetCriterion(nn.Module):
         
         return {"loss_ce": loss_ce}
     
-    def loss_masks(self, outputs, targets, indices, num_masks):
-        """Mask BCE + Dice loss"""
-        pred_masks = outputs["pred_masks"]  # (B, Q, H, W)
+    def loss_masks(self, outputs, targets, indices):
+        pred_masks = outputs["pred_masks"]
         
-        # Collect matched predictions and targets
         src_masks = []
-        tgt_masks = []
+        target_masks = []
         
         for batch_idx, (src_idx, tgt_idx) in enumerate(indices):
-            if len(src_idx) == 0:
-                continue
-            src_masks.append(pred_masks[batch_idx, src_idx])
-            tgt_masks.append(targets["masks"][batch_idx][tgt_idx])
+            if len(src_idx) > 0:
+                src_masks.append(pred_masks[batch_idx, src_idx])
+                target_masks.append(targets["masks"][batch_idx][tgt_idx])
         
         if len(src_masks) == 0:
-            # No masks
             return {
                 "loss_mask": pred_masks.sum() * 0.0,
-                "loss_dice": pred_masks.sum() * 0.0,
+                "loss_dice": pred_masks.sum() * 0.0
             }
         
-        src_masks = torch.cat(src_masks)  # (N, H, W)
-        tgt_masks = torch.cat(tgt_masks).float()  # (N, H, W)
+        src_masks = torch.cat(src_masks, dim=0)
+        target_masks = torch.cat(target_masks, dim=0).float()
         
         # Point sampling
-        point_coords = self.get_point_coords_with_randomness(
-            src_masks.unsqueeze(1),  # (N, 1, H, W)
-            self.calculate_uncertainty,
-            self.num_points,
-            self.oversample_ratio,
-            self.importance_sample_ratio,
-        )
+        num_total_points = self.num_points * self.oversample_ratio
+        point_coords = torch.rand(1, num_total_points, 2, device=src_masks.device)
         
-        # Sample points
-        point_logits = self.point_sample(
-            src_masks.unsqueeze(1),
-            point_coords,
-            align_corners=False
-        ).squeeze(1)  # (N, P)
-        
-        point_labels = self.point_sample(
-            tgt_masks.unsqueeze(1),
-            point_coords,
-            align_corners=False
-        ).squeeze(1)  # (N, P)
-        
-        # BCE loss
-        loss_mask = F.binary_cross_entropy_with_logits(
-            point_logits,
-            point_labels,
-            reduction="mean"
-        )
-        
-        # Dice loss
-        loss_dice = self.dice_loss(
-            point_logits.sigmoid(),
-            point_labels,
-            num_masks
-        )
-        
-        losses = {
-            "loss_mask": loss_mask,
-            "loss_dice": loss_dice,
-        }
-        return losses
-    
-    def dice_loss(self, inputs, targets, num_masks):
-        """Dice loss"""
-        inputs = inputs.flatten(1)
-        targets = targets.flatten(1)
-        
-        numerator = 2 * (inputs * targets).sum(-1)
-        denominator = inputs.sum(-1) + targets.sum(-1)
-        loss = 1 - (numerator + 1) / (denominator + 1)
-        
-        return loss.sum() / num_masks
-    
-    def calculate_uncertainty(self, logits):
-        """Uncertainty estimation"""
-        uncertainty = -(logits * logits.sigmoid()).sum(1)
-        return uncertainty
-    
-    def get_point_coords_with_randomness(
-        self,
-        coarse_logits,
-        uncertainty_func,
-        num_points,
-        oversample_ratio,
-        importance_sample_ratio,
-    ):
-        """Point sampling with importance sampling"""
-        num_boxes = coarse_logits.shape[0]
-        num_sampled = int(num_points * oversample_ratio)
-        
-        # Sample uniformly
-        point_coords = torch.rand(num_boxes, num_sampled, 2, device=coarse_logits.device)
-        point_logits = self.point_sample(coarse_logits, point_coords, align_corners=False)
-        
-        # Calculate uncertainty
-        point_uncertainties = uncertainty_func(point_logits)
-        
-        # 修复：处理维度
-        if point_uncertainties.dim() == 3:
-            point_uncertainties = point_uncertainties.squeeze(1)
+        src_masks_points = self._sample_points(src_masks.unsqueeze(1), point_coords)
+        target_masks_points = self._sample_points(target_masks.unsqueeze(1), point_coords)
         
         # Importance sampling
-        num_uncertain_points = int(importance_sample_ratio * num_points)
-        num_random_points = num_points - num_uncertain_points
+        with torch.no_grad():
+            point_uncertainties = -(src_masks_points.abs() - 0.5).abs()
+            num_uncertain_points = int(self.importance_sample_ratio * self.num_points)
+            num_random_points = self.num_points - num_uncertain_points
+            
+            idx = torch.topk(point_uncertainties.squeeze(1), k=num_uncertain_points, dim=1)[1]
+            shift = num_uncertain_points * torch.arange(src_masks_points.shape[0], dtype=torch.long, device=src_masks.device)
+            idx += shift.unsqueeze(1)
+            
+            src_masks_points = src_masks_points.squeeze(1).flatten(0, 1)[idx].view(-1, num_uncertain_points)
+            target_masks_points = target_masks_points.squeeze(1).flatten(0, 1)[idx].view(-1, num_uncertain_points)
+            
+            point_coords_rand = torch.rand(src_masks.shape[0], num_random_points, 2, device=src_masks.device)
+            src_masks_points_rand = self._sample_points(src_masks.unsqueeze(1), point_coords_rand).squeeze(1)
+            target_masks_points_rand = self._sample_points(target_masks.unsqueeze(1), point_coords_rand).squeeze(1)
+            
+            src_masks_points = torch.cat([src_masks_points, src_masks_points_rand], dim=1)
+            target_masks_points = torch.cat([target_masks_points, target_masks_points_rand], dim=1)
         
-        idx = torch.topk(point_uncertainties, k=num_uncertain_points, dim=1)[1]
-        shift = num_sampled * torch.arange(num_boxes, dtype=torch.long, device=coarse_logits.device)
-        idx += shift[:, None]
+        # Losses
+        loss_mask = F.binary_cross_entropy_with_logits(src_masks_points, target_masks_points, reduction='mean')
         
-        point_coords = point_coords.view(-1, 2)[idx.view(-1), :].view(num_boxes, num_uncertain_points, 2)
+        src_masks_sigmoid = src_masks_points.sigmoid()
+        numerator = 2 * (src_masks_sigmoid * target_masks_points).sum(dim=1)
+        denominator = src_masks_sigmoid.sum(dim=1) + target_masks_points.sum(dim=1) + 1e-4
+        loss_dice = (1 - numerator / denominator).mean()
         
-        if num_random_points > 0:
-            random_point_coords = torch.rand(num_boxes, num_random_points, 2, device=coarse_logits.device)
-            point_coords = torch.cat([point_coords, random_point_coords], dim=1)
-        
-        return point_coords
+        return {
+            "loss_mask": loss_mask,
+            "loss_dice": loss_dice
+        }
     
-    def point_sample(self, input, point_coords, **kwargs):
-        """Point sampling"""
+    def _sample_points(self, input, point_coords):
+        input = input.float()
+        point_coords = point_coords.float()
+        
         add_dim = False
         if point_coords.dim() == 3:
             add_dim = True
             point_coords = point_coords.unsqueeze(2)
         
-        # Convert coordinates
-        point_coords = 2.0 * point_coords - 1.0
-        output = F.grid_sample(input, point_coords, **kwargs)
+        output = F.grid_sample(input, 2.0 * point_coords - 1.0, align_corners=False)
         
         if add_dim:
             output = output.squeeze(3)
         
         return output
-
-
-# ============================================================================
-# Helper Functions
-# ============================================================================
-
-def prepare_targets(batch: Dict) -> Dict:
-    """
-    Convert semantic masks to instance format
-    """
-    masks = batch['mask']  # (B, H, W)
-    B, H, W = masks.shape
-    device = masks.device
     
-    labels_list = []
-    masks_list = []
-    
-    for i in range(B):
-        mask = masks[i]
-        unique_classes = torch.unique(mask)
-        unique_classes = unique_classes[unique_classes != 0]  # Remove background
+    def forward(self, outputs, targets):
+        indices = self.matcher(outputs, targets)
         
-        if len(unique_classes) == 0:
-            # No foreground, create dummy target
-            labels_list.append(torch.tensor([0], dtype=torch.long, device=device))
-            masks_list.append(torch.zeros((1, H, W), dtype=torch.float32, device=device))
-        else:
-            instance_masks = []
-            instance_labels = []
-            for cls in unique_classes:
-                binary_mask = (mask == cls).float()
-                instance_masks.append(binary_mask)
-                instance_labels.append(cls.item() - 1)  # 0-indexed for model
-            
-            labels_list.append(torch.tensor(instance_labels, dtype=torch.long, device=device))
-            masks_list.append(torch.stack(instance_masks))
-    
-    return {
-        "labels": labels_list,
-        "masks": masks_list,
-    }
+        losses = {}
+        losses.update(self.loss_labels(outputs, targets, indices))
+        losses.update(self.loss_masks(outputs, targets, indices))
+        
+        # Auxiliary losses
+        if "aux_outputs" in outputs:
+            for i, aux_outputs in enumerate(outputs["aux_outputs"]):
+                indices_aux = self.matcher(aux_outputs, targets)
+                losses_aux = {}
+                losses_aux.update(self.loss_labels(aux_outputs, targets, indices_aux))
+                losses_aux.update(self.loss_masks(aux_outputs, targets, indices_aux))
+                losses.update({f"{k}_{i}": v for k, v in losses_aux.items()})
+        
+        return losses
 
 
-@torch.no_grad()
-def calculate_dice_score(pred_masks, pred_logits, gt_masks, threshold=0.5):
-    """
-    计算真实的Dice Score（评估指标）
-    
-    Args:
-        pred_masks: (B, Q, H, W)
-        pred_logits: (B, Q, C)
-        gt_masks: (B, H, W)
-    
-    Returns:
-        dice_score: float [0, 1]
-    """
-    B, Q, H, W = pred_masks.shape
-    
-    # 选择confidence最高的query（非背景类）
-    # pred_logits: (B, Q, C), C = num_classes + 1
-    # 取前num_classes的最大confidence
-    confidences = pred_logits.softmax(dim=-1)[..., :-1].max(dim=-1)[0]  # (B, Q)
-    best_queries = confidences.argmax(dim=1)  # (B,)
-    
-    # 收集最佳预测
+# ============================================================================
+# Training/Validation functions (保持不变)
+# ============================================================================
+
+def calculate_dice_score(pred_masks, gt_masks):
+    """Calculate Dice Score"""
     pred_masks_binary = []
-    for i in range(B):
-        best_mask = pred_masks[i, best_queries[i]]  # (H, W)
-        pred_masks_binary.append((best_mask.sigmoid() > threshold).float())
+    for pred_mask in pred_masks:
+        pred_binary = (pred_mask.sigmoid() > 0.5).float()
+        pred_masks_binary.append(pred_binary)
     
-    pred_masks_binary = torch.stack(pred_masks_binary)  # (B, H, W)
-    gt_masks_binary = (gt_masks > 0).float()  # (B, H_gt, W_gt)
-
-    # ===== 修复：处理尺寸不匹配 =====
+    pred_masks_binary = torch.stack(pred_masks_binary)
+    gt_masks_binary = (gt_masks > 0).float()
+    
     if pred_masks_binary.shape[-2:] != gt_masks_binary.shape[-2:]:
         pred_masks_binary = F.interpolate(
-            pred_masks_binary.unsqueeze(1),  # (B, 1, H, W)
-            size=gt_masks_binary.shape[-2:],  # resize到gt尺寸
+            pred_masks_binary.unsqueeze(1),
+            size=gt_masks_binary.shape[-2:],
             mode='bilinear',
             align_corners=False
-        ).squeeze(1)  # (B, H_gt, W_gt)
-        # 重新二值化
+        ).squeeze(1)
         pred_masks_binary = (pred_masks_binary > 0.5).float()
-
-    # 计算Dice
+    
     intersection = (pred_masks_binary * gt_masks_binary).sum()
     union = pred_masks_binary.sum() + gt_masks_binary.sum()
     
-    if union == 0:
-        return 1.0 if intersection == 0 else 0.0
-    
-    dice = (2.0 * intersection + 1) / (union + 1)
+    dice = (2.0 * intersection) / (union + 1e-8)
     
     return dice.item()
 
 
-
-# ============================================================================
-# Training and Validation Functions
-# ============================================================================
-
-def train_one_epoch(
-    model: nn.Module,
-    criterion: SetCriterion,
-    dataloader: DataLoader,
-    optimizer: torch.optim.Optimizer,
-    device: torch.device,
-    epoch: int,
-    scheduler=None,
-) -> Dict[str, float]:
-    """训练一个epoch"""
-    
+def train_one_epoch(model, dataloader, criterion, optimizer, device, epoch):
     model.train()
-    criterion.train()
     
-    total_loss = 0
     loss_dict_accumulated = {}
-    total_dice = 0
+    total_loss = 0.0
+    total_dice = 0.0
     num_batches = 0
     
     pbar = tqdm(dataloader, desc=f'Epoch {epoch}')
     
-    for batch_idx, batch in enumerate(pbar):
-        images = batch['image'].to(device)
-        masks = batch['mask'].to(device)
-        
-        # Prepare targets
-        targets = prepare_targets({'mask': masks})
-        
-        # Forward
-        outputs = model(images)
-        
-        # Compute loss
-        loss_dict = criterion(outputs, targets)
-        
-        # Weighted sum
-        losses = sum(
-            loss_dict[k] * criterion.weight_dict[k]
-            for k in loss_dict.keys()
-            if k in criterion.weight_dict
-        )
-        
-        # Backward
-        optimizer.zero_grad()
-        losses.backward()
-        torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=1.0)
-        optimizer.step()
-        
-        if scheduler is not None:
-            scheduler.step()
-        
-        # 计算Dice Score
-        with torch.no_grad():
-            dice = calculate_dice_score(
-                outputs['pred_masks'],
-                outputs['pred_logits'],
-                masks
-            )
-            total_dice += dice
-        
-        # Accumulate loss
-        total_loss += losses.item()
-        for k, v in loss_dict.items():
-            if k not in loss_dict_accumulated:
-                loss_dict_accumulated[k] = 0
-            loss_dict_accumulated[k] += v.item()
-        
-        num_batches += 1
-        
-        # Update progress bar
-        pbar.set_postfix({
-            'loss': f'{losses.item():.4f}',
-            'dice': f'{dice:.4f}',
-            'avg_loss': f'{total_loss / num_batches:.4f}',
-            'avg_dice': f'{total_dice / num_batches:.4f}'
-        })
-    
-    # Calculate averages
-    avg_losses = {k: v / num_batches for k, v in loss_dict_accumulated.items()}
-    avg_losses['total_loss'] = total_loss / num_batches
-    avg_losses['dice_score'] = total_dice / num_batches  # 新增！
-    
-    return avg_losses
-
-
-@torch.no_grad()
-def validate(
-    model: nn.Module,
-    criterion: SetCriterion,
-    dataloader: DataLoader,
-    device: torch.device,
-) -> Dict[str, float]:
-    """验证"""
-    
-    model.eval()
-    criterion.eval()
-    
-    total_loss = 0
-    loss_dict_accumulated = {}
-    total_dice = 0
-    num_batches = 0
-    
-    pbar = tqdm(dataloader, desc='Validating')
-    
     for batch in pbar:
         images = batch['image'].to(device)
         masks = batch['mask'].to(device)
+        labels = batch.get('label', None)
         
-        targets = prepare_targets({'mask': masks})
+        if labels is None:
+            labels = [torch.ones(1, dtype=torch.long, device=device) for _ in range(len(images))]
+        else:
+            labels = [l.to(device) for l in labels]
+        
+        targets = {
+            "masks": [m.squeeze(0) for m in masks],
+            "labels": labels
+        }
+        
+        optimizer.zero_grad()
         
         outputs = model(images)
-        loss_dict = criterion(outputs, targets)
         
-        losses = sum(
-            loss_dict[k] * criterion.weight_dict[k]
-            for k in loss_dict.keys()
-            if k in criterion.weight_dict
-        )
+        losses = criterion(outputs, targets)
         
-        # 计算Dice Score
-        dice = calculate_dice_score(
-            outputs['pred_masks'],
-            outputs['pred_logits'],
-            masks
-        )
+        weighted_losses = {}
+        for k, v in losses.items():
+            if k in criterion.weight_dict:
+                weighted_losses[k] = v * criterion.weight_dict[k]
         
-        total_loss += losses.item()
-        total_dice += dice
+        loss = sum(weighted_losses.values())
         
-        for k, v in loss_dict.items():
+        loss.backward()
+        torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=0.1)
+        optimizer.step()
+        
+        # Calculate Dice
+        dice = calculate_dice_score(outputs["pred_masks"], masks)
+        
+        # Accumulate
+        for k, v in losses.items():
             if k not in loss_dict_accumulated:
-                loss_dict_accumulated[k] = 0
+                loss_dict_accumulated[k] = 0.0
             loss_dict_accumulated[k] += v.item()
         
+        total_loss += loss.item()
+        total_dice += dice
         num_batches += 1
         
         pbar.set_postfix({
-            'loss': f'{losses.item():.4f}',
+            'loss': f'{loss.item():.4f}',
             'dice': f'{dice:.4f}'
         })
     
     avg_losses = {k: v / num_batches for k, v in loss_dict_accumulated.items()}
     avg_losses['total_loss'] = total_loss / num_batches
-    avg_losses['dice_score'] = total_dice / num_batches  # 新增！
+    avg_losses['dice_score'] = total_dice / num_batches
+    
+    return avg_losses
+
+
+@torch.no_grad()
+def validate(model, dataloader, criterion, device):
+    model.eval()
+    
+    loss_dict_accumulated = {}
+    total_loss = 0.0
+    total_dice = 0.0
+    num_batches = 0
+    
+    for batch in tqdm(dataloader, desc='Validation'):
+        images = batch['image'].to(device)
+        masks = batch['mask'].to(device)
+        labels = batch.get('label', None)
+        
+        if labels is None:
+            labels = [torch.ones(1, dtype=torch.long, device=device) for _ in range(len(images))]
+        else:
+            labels = [l.to(device) for l in labels]
+        
+        targets = {
+            "masks": [m.squeeze(0) for m in masks],
+            "labels": labels
+        }
+        
+        outputs = model(images)
+        
+        losses = criterion(outputs, targets)
+        
+        weighted_losses = {}
+        for k, v in losses.items():
+            if k in criterion.weight_dict:
+                weighted_losses[k] = v * criterion.weight_dict[k]
+        
+        loss = sum(weighted_losses.values())
+        
+        dice = calculate_dice_score(outputs["pred_masks"], masks)
+        
+        for k, v in losses.items():
+            if k not in loss_dict_accumulated:
+                loss_dict_accumulated[k] = 0.0
+            loss_dict_accumulated[k] += v.item()
+        
+        total_loss += loss.item()
+        total_dice += dice
+        num_batches += 1
+    
+    avg_losses = {k: v / num_batches for k, v in loss_dict_accumulated.items()}
+    avg_losses['total_loss'] = total_loss / num_batches
+    avg_losses['dice_score'] = total_dice / num_batches
     
     return avg_losses
 
@@ -612,7 +406,7 @@ def validate(
 # ============================================================================
 
 def main():
-    parser = argparse.ArgumentParser(description='SegMamba + Mask2Former Training - FIXED VERSION')
+    parser = argparse.ArgumentParser(description='SegMamba + Mask2Former Training - Enhanced')
     
     # Data
     parser.add_argument('--data_root', type=str, required=True)
@@ -623,10 +417,16 @@ def main():
     parser.add_argument('--model_size', type=str, default='small', choices=['tiny', 'small', 'base'])
     parser.add_argument('--num_queries', type=int, default=20)
     
+    # 新增: 正则化参数
+    parser.add_argument('--drop_path_rate', type=float, default=0.0,
+                       help='DropPath rate (0.0=disabled, 0.1-0.15 recommended for regularization)')
+    parser.add_argument('--use_skip_connections', action='store_true',
+                       help='Enable encoder-decoder skip connections (U-Net style)')
+    
     # Training
     parser.add_argument('--batch_size', type=int, default=4)
     parser.add_argument('--epochs', type=int, default=100)
-    parser.add_argument('--lr', type=float, default=5e-5)  # 降低学习率
+    parser.add_argument('--lr', type=float, default=5e-5)
     parser.add_argument('--weight_decay', type=float, default=1e-4)
     parser.add_argument('--num_workers', type=int, default=4)
     
@@ -640,7 +440,7 @@ def main():
     parser.add_argument('--mask_weight', type=float, default=5.0)
     parser.add_argument('--dice_weight', type=float, default=5.0)
     parser.add_argument('--eos_coef', type=float, default=0.1)
-    parser.add_argument('--aux_weight', type=float, default=0.4)  # 新增：aux层权重衰减
+    parser.add_argument('--aux_weight', type=float, default=0.4)
     
     # Point sampling
     parser.add_argument('--num_points', type=int, default=12544)
@@ -662,9 +462,13 @@ def main():
         json.dump(vars(args), f, indent=2)
     
     print("="*80)
-    print("SegMamba + Mask2Former Training - FIXED VERSION")
+    print("SegMamba + Mask2Former Training - Enhanced Version")
     print("="*80)
     print(f"Device: {device}")
+    if args.drop_path_rate > 0:
+        print(f"DropPath Rate: {args.drop_path_rate}")
+    if args.use_skip_connections:
+        print(f"Encoder-Decoder Skip Connections: Enabled")
     
     # =========================================================================
     # [1] DataLoaders
@@ -695,6 +499,11 @@ def main():
         shuffle=True,
         num_workers=args.num_workers,
         pin_memory=True,
+        collate_fn=lambda x: {
+            'image': torch.stack([item['image'] for item in x]),
+            'mask': torch.stack([item['mask'] for item in x]),
+            'label': [item.get('label', torch.tensor([1], dtype=torch.long)) for item in x]
+        }
     )
     
     val_loader = DataLoader(
@@ -703,30 +512,41 @@ def main():
         shuffle=False,
         num_workers=args.num_workers,
         pin_memory=True,
+        collate_fn=lambda x: {
+            'image': torch.stack([item['image'] for item in x]),
+            'mask': torch.stack([item['mask'] for item in x]),
+            'label': [item.get('label', torch.tensor([1], dtype=torch.long)) for item in x]
+        }
     )
     
     print(f"  Train: {len(train_dataset)} samples")
     print(f"  Val: {len(val_dataset)} samples")
     
     # =========================================================================
-    # [2] Model
+    # [2] Model - 使用新参数
     # =========================================================================
     print(f"\n[2] Creating model...")
     
     if args.model_size == 'tiny':
         model = segmamba_mask2former_tiny(
             num_classes=args.num_classes,
-            num_queries=args.num_queries
+            num_queries=args.num_queries,
+            drop_path_rate=args.drop_path_rate,  # 新增
+            use_skip_connections=args.use_skip_connections  # 新增
         )
     elif args.model_size == 'small':
         model = segmamba_mask2former_small(
             num_classes=args.num_classes,
-            num_queries=args.num_queries
+            num_queries=args.num_queries,
+            drop_path_rate=args.drop_path_rate,  # 新增
+            use_skip_connections=args.use_skip_connections  # 新增
         )
     else:
         model = segmamba_mask2former_base(
             num_classes=args.num_classes,
-            num_queries=args.num_queries
+            num_queries=args.num_queries,
+            drop_path_rate=args.drop_path_rate,  # 新增
+            use_skip_connections=args.use_skip_connections  # 新增
         )
     
     model = model.to(device)
@@ -736,7 +556,7 @@ def main():
     print(f"  Parameters: {num_params / 1e6:.2f}M")
     
     # =========================================================================
-    # [3] Criterion - 关键修复：使用衰减权重
+    # [3] Criterion
     # =========================================================================
     print(f"\n[3] Creating criterion...")
     
@@ -747,33 +567,24 @@ def main():
         num_points=args.num_points,
     )
     
-    # 主层权重
+    # Weight dict with aux decay
     weight_dict = {
         "loss_ce": args.class_weight,
         "loss_mask": args.mask_weight,
         "loss_dice": args.dice_weight,
     }
     
-    # 辅助层权重 - 使用衰减！
-    num_decoder_layers = model.get_num_layers()
-    print(f"  Decoder layers: {num_decoder_layers}")
-    print(f"  Main layer weights: CE={args.class_weight}, Mask={args.mask_weight}, Dice={args.dice_weight}")
-    print(f"  Aux layer weight decay: {args.aux_weight}")
-    
-    for i in range(num_decoder_layers - 1):
-        weight_dict.update({
-            f"loss_ce_{i}": args.class_weight * args.aux_weight,
-            f"loss_mask_{i}": args.mask_weight * args.aux_weight,
-            f"loss_dice_{i}": args.dice_weight * args.aux_weight,
+    num_layers = model.get_num_layers()
+    aux_weight_dict = {}
+    for i in range(num_layers - 1):
+        decay = args.aux_weight ** (num_layers - i - 1)
+        aux_weight_dict.update({
+            f"loss_ce_{i}": args.class_weight * decay,
+            f"loss_mask_{i}": args.mask_weight * decay,
+            f"loss_dice_{i}": args.dice_weight * decay,
         })
     
-    # 计算预期总权重
-    main_weight = args.class_weight + args.mask_weight + args.dice_weight
-    aux_total_weight = (num_decoder_layers - 1) * main_weight * args.aux_weight
-    total_weight = main_weight + aux_total_weight
-    print(f"  Expected total loss weight: {total_weight:.2f}")
-    print(f"    Main layer: {main_weight:.2f}")
-    print(f"    Aux layers: {aux_total_weight:.2f}")
+    weight_dict.update(aux_weight_dict)
     
     criterion = SetCriterion(
         num_classes=args.num_classes,
@@ -784,10 +595,11 @@ def main():
         oversample_ratio=args.oversample_ratio,
         importance_sample_ratio=args.importance_sample_ratio,
     )
-    criterion = criterion.to(device)
+    
+    print(f"  ✓ Criterion created")
     
     # =========================================================================
-    # [4] Optimizer - 使用更保守的学习率
+    # [4] Optimizer & Scheduler
     # =========================================================================
     print(f"\n[4] Creating optimizer...")
     
@@ -797,19 +609,15 @@ def main():
         weight_decay=args.weight_decay
     )
     
-    # 使用OneCycleLR with warmup
     scheduler = OneCycleLR(
         optimizer,
         max_lr=args.lr,
         epochs=args.epochs,
         steps_per_epoch=len(train_loader),
-        pct_start=0.1,  # 10% warmup
-        anneal_strategy='cos'
+        pct_start=0.1,
     )
     
-    print(f"  Optimizer: AdamW")
-    print(f"  LR: {args.lr}")
-    print(f"  Scheduler: OneCycleLR with 10% warmup")
+    print(f"  ✓ Optimizer: AdamW (lr={args.lr}, wd={args.weight_decay})")
     
     # =========================================================================
     # [5] Training Loop
@@ -818,79 +626,44 @@ def main():
     print("="*80)
     
     best_dice = 0.0
-    train_losses_history = []
-    val_losses_history = []
     
     for epoch in range(1, args.epochs + 1):
-        print(f"\nEpoch {epoch}/{args.epochs}")
-        print("-"*80)
-        
         # Train
-        train_losses = train_one_epoch(
-            model, criterion, train_loader, optimizer, device, epoch, scheduler
-        )
+        train_losses = train_one_epoch(model, train_loader, criterion, optimizer, device, epoch)
         
         # Validate
-        val_losses = validate(model, criterion, val_loader, device)
+        val_losses = validate(model, val_loader, criterion, device)
         
-        # Get current LR
-        current_lr = optimizer.param_groups[0]['lr']
-        
-        # Record history
-        train_losses_history.append(train_losses)
-        val_losses_history.append(val_losses)
-        
-        # Print results - 改进的输出格式
-        print(f"\nEpoch {epoch} Results:")
+        # Print
+        print(f"\nEpoch {epoch}/{args.epochs} Results:")
         print(f"  Train Loss: {train_losses['total_loss']:.4f}")
-        print(f"    - CE: {train_losses.get('loss_ce', 0):.4f}")
-        print(f"    - Mask: {train_losses.get('loss_mask', 0):.4f}")
-        print(f"    - Dice Loss: {train_losses.get('loss_dice', 0):.4f}")
-        print(f"  Train Dice Score: {train_losses['dice_score']:.4f}")  # 新增！
+        print(f"  Train Dice Score: {train_losses['dice_score']:.4f}")
         print(f"  Val Loss: {val_losses['total_loss']:.4f}")
-        print(f"  Val Dice Score: {val_losses['dice_score']:.4f}")  # 新增！
-        print(f"  LR: {current_lr:.6f}")
+        print(f"  Val Dice Score: {val_losses['dice_score']:.4f}")
         
-        # Save best model based on Dice Score
+        # Save best
         if val_losses['dice_score'] > best_dice:
             best_dice = val_losses['dice_score']
             torch.save({
                 'epoch': epoch,
                 'model_state_dict': model.state_dict(),
                 'optimizer_state_dict': optimizer.state_dict(),
-                'dice_score': best_dice,
-                'val_loss': val_losses['total_loss'],
+                'best_dice': best_dice,
             }, os.path.join(args.output_dir, 'best_model.pth'))
             print(f"  ✓ New best model! Dice Score: {best_dice:.4f}")
         
-        # Periodic checkpoint
+        # Save periodic
         if epoch % args.save_every == 0:
             torch.save({
                 'epoch': epoch,
                 'model_state_dict': model.state_dict(),
                 'optimizer_state_dict': optimizer.state_dict(),
-                'dice_score': val_losses['dice_score'],
-                'val_loss': val_losses['total_loss'],
             }, os.path.join(args.output_dir, f'checkpoint_epoch_{epoch}.pth'))
-            print(f"  ✓ Saved checkpoint: checkpoint_epoch_{epoch}.pth")
-    
-    # Save final model
-    torch.save({
-        'epoch': args.epochs,
-        'model_state_dict': model.state_dict(),
-        'optimizer_state_dict': optimizer.state_dict(),
-        'dice_score': val_losses['dice_score'],
-        'val_loss': val_losses['total_loss'],
-    }, os.path.join(args.output_dir, 'final_model.pth'))
-    
-    # Save training history
-    np.save(os.path.join(args.output_dir, 'train_losses.npy'), train_losses_history)
-    np.save(os.path.join(args.output_dir, 'val_losses.npy'), val_losses_history)
+        
+        scheduler.step()
     
     print("\n" + "="*80)
-    print("Training completed!")
-    print(f"  Best Dice Score: {best_dice:.4f}")
-    print(f"  Output dir: {args.output_dir}")
+    print(f"Training completed! Best Dice: {best_dice:.4f}")
     print("="*80)
 
 

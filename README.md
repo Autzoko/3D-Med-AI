@@ -1,0 +1,12 @@
+python train.py \
+    --data_root dataset/BUSI/processed \
+    --output_dir ./outputs/busi_experiment \
+    --model_size small \
+    --num_classes 1 \
+    --num_queries 20 \
+    --batch_size 4 \
+    --epochs 100 \
+    --lr 1e-5 \
+    --weight_decay 5e-4
+    --aux_weight 0.2 \
+    --save_every 10

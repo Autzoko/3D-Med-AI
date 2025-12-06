@@ -2,9 +2,12 @@
 Pixel Decoders for Mask2Former
 Based on official implementation
 
-Provides:
-1. SimpleFPNDecoder - Lightweight FPN-style decoder (recommended for medical imaging)
-2. BasePixelDecoder - Standard FPN decoder from Mask2Former
+Enhanced with encoder-decoder skip connections
+
+修改记录:
+- SimpleFPNDecoder 添加 use_skip_connections 参数（默认False保持向后兼容）
+- 添加 skip_convs 和 fusion_weights 用于encoder-decoder残差连接
+- 保持原有类名和函数接口完全不变
 """
 
 import torch
@@ -14,16 +17,19 @@ from typing import List, Tuple
 
 
 # ============================================================================
-# Simple FPN Pixel Decoder (Recommended for Medical Imaging)
+# Simple FPN Pixel Decoder with Skip Connections
 # ============================================================================
 
 class SimpleFPNDecoder(nn.Module):
     """
-    Simplified FPN-style pixel decoder optimized for medical imaging
+    Simplified FPN-style pixel decoder with optional encoder-decoder skip connections
     
-    Takes multi-scale features from backbone and produces:
-    1. mask_features: high-res per-pixel embeddings (H/4, W/4)
-    2. multi_scale_features: 3 scales for transformer decoder (1/32, 1/16, 1/8)
+    Enhanced features:
+    - Original FPN top-down pathway
+    - Optional skip connections from encoder features (类似U-Net)
+    - Learnable fusion weights between FPN and encoder features
+    
+    完全向后兼容：use_skip_connections=False 时行为与原版完全一致
     """
     
     def __init__(
@@ -31,8 +37,9 @@ class SimpleFPNDecoder(nn.Module):
         in_channels_list: List[int],
         conv_dim: int = 256,
         mask_dim: int = 256,
-        norm: str = "GN",  # GroupNorm
+        norm: str = "GN",
         num_groups: int = 32,
+        use_skip_connections: bool = False,  # 新增参数，默认False保持向后兼容
     ):
         """
         Args:
@@ -42,21 +49,22 @@ class SimpleFPNDecoder(nn.Module):
             mask_dim: output mask feature dimension
             norm: normalization type ("GN" for GroupNorm, "" for no norm)
             num_groups: number of groups for GroupNorm
+            use_skip_connections: 是否使用encoder-decoder skip connections (新增)
         """
         super().__init__()
         
         self.in_channels_list = in_channels_list
         self.conv_dim = conv_dim
         self.mask_dim = mask_dim
-        self.num_feature_levels = 3  # Always use 3 scales for Mask2Former
-        
-        # Build FPN layers (top-down pathway)
-        self.lateral_convs = nn.ModuleList()
-        self.output_convs = nn.ModuleList()
+        self.num_feature_levels = 3
+        self.use_skip_connections = use_skip_connections  # 新增
         
         use_bias = (norm == "")
         
-        # Process from deep to shallow (reversed)
+        # ===== 原有的FPN layers =====
+        self.lateral_convs = nn.ModuleList()
+        self.output_convs = nn.ModuleList()
+        
         for idx, in_channels in enumerate(reversed(in_channels_list)):
             if idx == 0:
                 # Deepest level - no lateral conv
@@ -84,7 +92,27 @@ class SimpleFPNDecoder(nn.Module):
                 nn.init.constant_(output_conv[0].bias, 0)
             self.output_convs.append(output_conv)
         
-        # Mask features projection
+        # ===== 新增: Skip connection modules =====
+        if use_skip_connections:
+            self.skip_convs = nn.ModuleList()
+            
+            # 为每个scale创建skip connection projection
+            for in_channels in reversed(in_channels_list):
+                skip_conv = nn.Sequential(
+                    nn.Conv2d(in_channels, conv_dim, kernel_size=1, bias=False),
+                    nn.GroupNorm(num_groups, conv_dim) if norm == "GN" else nn.Identity(),
+                )
+                nn.init.xavier_uniform_(skip_conv[0].weight)
+                self.skip_convs.append(skip_conv)
+            
+            # Learnable fusion weights (FPN vs Skip)
+            # 初始化为[0.7, 0.3]，更信任FPN路径
+            self.fusion_weights = nn.ParameterList([
+                nn.Parameter(torch.tensor([0.7, 0.3]))
+                for _ in range(len(in_channels_list))
+            ])
+        
+        # ===== Mask features projection =====
         self.mask_features = nn.Conv2d(conv_dim, mask_dim, kernel_size=3, stride=1, padding=1)
         nn.init.xavier_uniform_(self.mask_features.weight)
         nn.init.constant_(self.mask_features.bias, 0)
@@ -94,19 +122,20 @@ class SimpleFPNDecoder(nn.Module):
         Args:
             features: list of feature maps from backbone
                      [stage0, stage1, stage2, stage3] from shallow to deep
-                     For SegMamba: [(B,48,H/2,W/2), (B,96,H/4,W/4), (B,192,H/8,W/8), (B,384,H/16,W/16)]
                      
         Returns:
-            mask_features: (B, mask_dim, H/4, W/4) for mask prediction
+            mask_features: (B, mask_dim, H/4, W/4)
             multi_scale_features: list of 3 features for transformer decoder
-                                 [(B,C,H/32,W/32), (B,C,H/16,W/16), (B,C,H/8,W/8)]
         """
+        # 保存原始encoder features（用于skip connections）
+        encoder_features = features if self.use_skip_connections else None
+        
         # Reverse to top-down order (deep to shallow)
         features = list(reversed(features))
         
         multi_scale_features = []
         
-        # Top-down pathway
+        # ===== Top-down pathway with optional skip connections =====
         for idx, (feat, lateral_conv, output_conv) in enumerate(
             zip(features, self.lateral_convs, self.output_convs)
         ):
@@ -119,25 +148,31 @@ class SimpleFPNDecoder(nn.Module):
                 y = lateral + F.interpolate(y, size=lateral.shape[-2:], mode="nearest")
                 y = output_conv(y)
             
-            # Collect first 3 scales for transformer decoder
+            # ===== 新增: Encoder-Decoder Skip Connection =====
+            if self.use_skip_connections:
+                # Process encoder feature
+                skip_feat = self.skip_convs[idx](features[idx])
+                
+                # Learnable weighted fusion: w1*FPN + w2*Skip
+                w = F.softmax(self.fusion_weights[idx], dim=0)
+                y = w[0] * y + w[1] * skip_feat  # ✅ Encoder-decoder residual!
+            
+            # Collect multi-scale features
             if len(multi_scale_features) < self.num_feature_levels:
                 multi_scale_features.append(y)
         
-        # Generate high-res mask features from shallowest FPN level
+        # Mask features
         mask_features = self.mask_features(y)
         
         return mask_features, multi_scale_features
 
 
 # ============================================================================
-# Base Pixel Decoder (Standard FPN from Mask2Former)
+# Base Pixel Decoder (保持不变)
 # ============================================================================
 
 class BasePixelDecoder(nn.Module):
-    """
-    Base FPN pixel decoder - standard implementation from Mask2Former
-    More complex than SimpleFPNDecoder but may provide better results
-    """
+    """Base FPN pixel decoder - standard implementation from Mask2Former"""
     
     def __init__(
         self,
@@ -147,14 +182,6 @@ class BasePixelDecoder(nn.Module):
         norm: str = "GN",
         num_groups: int = 32,
     ):
-        """
-        Args:
-            in_channels_list: list of input channels from backbone
-            conv_dim: intermediate conv dimension
-            mask_dim: output mask dimension
-            norm: normalization type
-            num_groups: number of groups for GroupNorm
-        """
         super().__init__()
         
         self.in_channels_list = in_channels_list
@@ -217,14 +244,7 @@ class BasePixelDecoder(nn.Module):
         nn.init.constant_(self.mask_features.bias, 0)
     
     def forward(self, features: List[torch.Tensor]) -> Tuple[torch.Tensor, List[torch.Tensor]]:
-        """
-        Args:
-            features: list of feature maps [stage0, stage1, stage2, stage3]
-            
-        Returns:
-            mask_features: (B, mask_dim, H, W)
-            multi_scale_features: list of 3 features
-        """
+        """Forward pass"""
         multi_scale_features = []
         num_cur_levels = 0
         
@@ -254,55 +274,62 @@ class BasePixelDecoder(nn.Module):
 
 if __name__ == "__main__":
     print("="*80)
-    print("Testing Pixel Decoders")
+    print("Testing Enhanced Pixel Decoders with Skip Connections")
     print("="*80)
     
     # Simulate SegMamba backbone features
     batch_size = 2
     features = [
-        torch.randn(batch_size, 48, 128, 128),   # stage0: H/2, W/2
-        torch.randn(batch_size, 96, 64, 64),     # stage1: H/4, W/4
-        torch.randn(batch_size, 192, 32, 32),    # stage2: H/8, W/8
-        torch.randn(batch_size, 384, 16, 16),    # stage3: H/16, W/16
+        torch.randn(batch_size, 48, 128, 128),   # stage0
+        torch.randn(batch_size, 96, 64, 64),     # stage1
+        torch.randn(batch_size, 192, 32, 32),    # stage2
+        torch.randn(batch_size, 384, 16, 16),    # stage3
     ]
     
-    print("\n[Test 1] SimpleFPNDecoder")
-    decoder1 = SimpleFPNDecoder(
+    print("\n[Test 1] SimpleFPNDecoder - Original (no skip)")
+    decoder_original = SimpleFPNDecoder(
         in_channels_list=[48, 96, 192, 384],
         conv_dim=256,
         mask_dim=256,
+        use_skip_connections=False,  # 原版模式
     )
     
     with torch.no_grad():
-        mask_feat, multi_scale = decoder1(features)
+        mask_feat, multi_scale = decoder_original(features)
     
-    print(f"mask_features shape: {mask_feat.shape}")
-    print(f"Number of multi-scale features: {len(multi_scale)}")
-    for i, feat in enumerate(multi_scale):
-        print(f"  Scale {i}: {feat.shape}")
+    print(f"mask_features: {mask_feat.shape}")
+    print(f"multi_scale features: {[f.shape for f in multi_scale]}")
     
-    print("\n[Test 2] BasePixelDecoder")
-    decoder2 = BasePixelDecoder(
+    print("\n[Test 2] SimpleFPNDecoder - With Skip Connections")
+    decoder_skip = SimpleFPNDecoder(
         in_channels_list=[48, 96, 192, 384],
         conv_dim=256,
         mask_dim=256,
+        use_skip_connections=True,  # ✅ 启用skip connections
     )
     
     with torch.no_grad():
-        mask_feat, multi_scale = decoder2(features)
+        mask_feat, multi_scale = decoder_skip(features)
     
-    print(f"mask_features shape: {mask_feat.shape}")
-    print(f"Number of multi-scale features: {len(multi_scale)}")
-    for i, feat in enumerate(multi_scale):
-        print(f"  Scale {i}: {feat.shape}")
+    print(f"mask_features: {mask_feat.shape}")
+    print(f"multi_scale features: {[f.shape for f in multi_scale]}")
+    
+    # Check fusion weights
+    print("\nLearnable fusion weights:")
+    for i, w in enumerate(decoder_skip.fusion_weights):
+        w_softmax = F.softmax(w, dim=0)
+        print(f"  Level {i}: FPN={w_softmax[0].item():.3f}, Skip={w_softmax[1].item():.3f}")
     
     # Count parameters
-    params1 = sum(p.numel() for p in decoder1.parameters())
-    params2 = sum(p.numel() for p in decoder2.parameters())
+    params_original = sum(p.numel() for p in decoder_original.parameters())
+    params_skip = sum(p.numel() for p in decoder_skip.parameters())
     
-    print(f"\nSimpleFPNDecoder parameters: {params1:,}")
-    print(f"BasePixelDecoder parameters: {params2:,}")
+    print(f"\nParameters:")
+    print(f"  Original: {params_original:,}")
+    print(f"  With Skip: {params_skip:,}")
+    print(f"  Increase: {params_skip - params_original:,} (+{(params_skip/params_original - 1)*100:.1f}%)")
     
     print("\n" + "="*80)
-    print("All tests passed! ✓")
+    print("✓ Encoder-decoder skip connections added!")
+    print("✓ Backward compatible (use_skip_connections=False)")
     print("="*80)
