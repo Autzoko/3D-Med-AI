@@ -1,11 +1,9 @@
 """
-SegMamba + Mask2Former 完整训练脚本 - 增强版
+SegMamba + Mask2Former 完整训练脚本 - 修复版v2
 
-新增功能:
-1. DropPath regularization (--drop_path_rate)
-2. Encoder-decoder skip connections (--use_skip_connections)
-
-其他功能保持不变
+修复:
+1. Hungarian Matcher索引越界问题
+2. 添加DropPath和Skip Connections支持
 """
 
 import argparse
@@ -29,11 +27,11 @@ from data.dataloader import NPYSegmentationDataset, get_default_transforms
 
 
 # ============================================================================
-# Hungarian Matcher (保持不变)
+# Hungarian Matcher - 修复版
 # ============================================================================
 
 class HungarianMatcher(nn.Module):
-    """Hungarian Matcher for bipartite matching"""
+    """Hungarian Matcher for bipartite matching - 修复索引越界"""
     
     def __init__(
         self,
@@ -51,17 +49,25 @@ class HungarianMatcher(nn.Module):
     @torch.no_grad()
     def forward(self, outputs, targets):
         bs = outputs["pred_logits"].shape[0]
+        num_queries = outputs["pred_logits"].shape[1]
         
-        out_prob = outputs["pred_logits"].flatten(0, 1).softmax(-1)
-        out_mask = outputs["pred_masks"].flatten(0, 1)
+        # Flatten
+        out_prob = outputs["pred_logits"].flatten(0, 1).softmax(-1)  # (B*Q, C+1)
+        out_mask = outputs["pred_masks"].flatten(0, 1)  # (B*Q, H, W)
         
+        # Concatenate targets
         tgt_ids = torch.cat([v for v in targets["labels"]])
         tgt_mask = torch.cat([v for v in targets["masks"]])
+        
+        # 🔧 修复：确保tgt_ids在有效范围内 [0, num_classes]
+        # num_classes不包含background，所以有效范围是 [0, num_classes]
+        num_classes = out_prob.shape[-1] - 1  # 减去background类
+        tgt_ids = torch.clamp(tgt_ids, 0, num_classes)  # ← 关键修复
         
         # 1. Classification cost
         cost_class = -out_prob[:, tgt_ids]
         
-        # 2. Mask cost
+        # 2. Mask cost (point sampling)
         out_mask_flat = out_mask.flatten(1)
         tgt_mask_flat = tgt_mask.flatten(1).float()
         
@@ -71,11 +77,18 @@ class HungarianMatcher(nn.Module):
         out_mask_sampled = out_mask_flat[:, point_idx].sigmoid()
         tgt_mask_sampled = tgt_mask_flat[:, point_idx]
         
-        cost_mask = F.binary_cross_entropy_with_logits(
-            out_mask_flat[:, point_idx].unsqueeze(1).expand(-1, tgt_mask_sampled.shape[0], -1),
-            tgt_mask_sampled.unsqueeze(0).expand(out_mask_sampled.shape[0], -1, -1),
-            reduction='none'
-        ).mean(-1)
+        # 🔧 修复：使用mean reduction避免广播问题
+        with torch.no_grad():
+            cost_mask_expanded = torch.stack([
+                F.binary_cross_entropy_with_logits(
+                    out_mask_flat[:, point_idx],
+                    tgt_mask_sampled[i:i+1].expand(out_mask_flat.shape[0], -1),
+                    reduction='none'
+                ).mean(-1)
+                for i in range(tgt_mask_sampled.shape[0])
+            ], dim=1)  # (B*Q, N)
+        
+        cost_mask = cost_mask_expanded
         
         # 3. Dice cost
         numerator = 2 * (out_mask_sampled.unsqueeze(1) * tgt_mask_sampled.unsqueeze(0)).sum(-1)
@@ -84,7 +97,7 @@ class HungarianMatcher(nn.Module):
         
         # Final cost
         C = self.cost_class * cost_class + self.cost_mask * cost_mask + self.cost_dice * cost_dice
-        C = C.view(bs, -1, tgt_ids.shape[0]).cpu()
+        C = C.view(bs, num_queries, -1).cpu()
         
         # Hungarian matching
         sizes = [len(v) for v in targets["labels"]]
@@ -103,7 +116,7 @@ class HungarianMatcher(nn.Module):
 
 
 # ============================================================================
-# SetCriterion (保持不变，已验证正确)
+# SetCriterion
 # ============================================================================
 
 class SetCriterion(nn.Module):
@@ -176,7 +189,7 @@ class SetCriterion(nn.Module):
         target_masks = torch.cat(target_masks, dim=0).float()
         
         # Point sampling
-        num_total_points = self.num_points * self.oversample_ratio
+        num_total_points = int(self.num_points * self.oversample_ratio)
         point_coords = torch.rand(1, num_total_points, 2, device=src_masks.device)
         
         src_masks_points = self._sample_points(src_masks.unsqueeze(1), point_coords)
@@ -251,7 +264,7 @@ class SetCriterion(nn.Module):
 
 
 # ============================================================================
-# Training/Validation functions (保持不变)
+# Training/Validation functions
 # ============================================================================
 
 def calculate_dice_score(pred_masks, gt_masks):
@@ -406,7 +419,7 @@ def validate(model, dataloader, criterion, device):
 # ============================================================================
 
 def main():
-    parser = argparse.ArgumentParser(description='SegMamba + Mask2Former Training - Enhanced')
+    parser = argparse.ArgumentParser(description='SegMamba + Mask2Former Training - Fixed v2')
     
     # Data
     parser.add_argument('--data_root', type=str, required=True)
@@ -417,11 +430,9 @@ def main():
     parser.add_argument('--model_size', type=str, default='small', choices=['tiny', 'small', 'base'])
     parser.add_argument('--num_queries', type=int, default=20)
     
-    # 新增: 正则化参数
-    parser.add_argument('--drop_path_rate', type=float, default=0.0,
-                       help='DropPath rate (0.0=disabled, 0.1-0.15 recommended for regularization)')
-    parser.add_argument('--use_skip_connections', action='store_true',
-                       help='Enable encoder-decoder skip connections (U-Net style)')
+    # 正则化
+    parser.add_argument('--drop_path_rate', type=float, default=0.0)
+    parser.add_argument('--use_skip_connections', action='store_true')
     
     # Training
     parser.add_argument('--batch_size', type=int, default=4)
@@ -462,13 +473,13 @@ def main():
         json.dump(vars(args), f, indent=2)
     
     print("="*80)
-    print("SegMamba + Mask2Former Training - Enhanced Version")
+    print("SegMamba + Mask2Former Training - Fixed v2")
     print("="*80)
     print(f"Device: {device}")
     if args.drop_path_rate > 0:
         print(f"DropPath Rate: {args.drop_path_rate}")
     if args.use_skip_connections:
-        print(f"Encoder-Decoder Skip Connections: Enabled")
+        print(f"Skip Connections: Enabled")
     
     # =========================================================================
     # [1] DataLoaders
@@ -523,7 +534,7 @@ def main():
     print(f"  Val: {len(val_dataset)} samples")
     
     # =========================================================================
-    # [2] Model - 使用新参数
+    # [2] Model
     # =========================================================================
     print(f"\n[2] Creating model...")
     
@@ -531,22 +542,22 @@ def main():
         model = segmamba_mask2former_tiny(
             num_classes=args.num_classes,
             num_queries=args.num_queries,
-            drop_path_rate=args.drop_path_rate,  # 新增
-            use_skip_connections=args.use_skip_connections  # 新增
+            drop_path_rate=args.drop_path_rate,
+            use_skip_connections=args.use_skip_connections
         )
     elif args.model_size == 'small':
         model = segmamba_mask2former_small(
             num_classes=args.num_classes,
             num_queries=args.num_queries,
-            drop_path_rate=args.drop_path_rate,  # 新增
-            use_skip_connections=args.use_skip_connections  # 新增
+            drop_path_rate=args.drop_path_rate,
+            use_skip_connections=args.use_skip_connections
         )
     else:
         model = segmamba_mask2former_base(
             num_classes=args.num_classes,
             num_queries=args.num_queries,
-            drop_path_rate=args.drop_path_rate,  # 新增
-            use_skip_connections=args.use_skip_connections  # 新增
+            drop_path_rate=args.drop_path_rate,
+            use_skip_connections=args.use_skip_connections
         )
     
     model = model.to(device)
@@ -567,7 +578,6 @@ def main():
         num_points=args.num_points,
     )
     
-    # Weight dict with aux decay
     weight_dict = {
         "loss_ce": args.class_weight,
         "loss_mask": args.mask_weight,
