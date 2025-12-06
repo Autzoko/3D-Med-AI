@@ -12,7 +12,7 @@ sys.path.append('.')
 
 try:
     from model.backbone.segmamba_backbone_2d import SegMamba2DBackbone
-    from simple_decoder import SimpleSegDecoder
+    from model.detector.simple_decoder import SimpleSegDecoder
 except ImportError:
     print("Warning: Using relative import")
     from backbone.segmamba_backbone_2d import SegMamba2DBackbone
