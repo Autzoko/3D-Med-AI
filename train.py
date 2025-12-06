@@ -1,9 +1,7 @@
 """
-SegMamba + Mask2Former 完整训练脚本 - 修复版v2
+SegMamba + Mask2Former 训练脚本 - 最终修复版
 
-修复:
-1. Hungarian Matcher索引越界问题
-2. 添加DropPath和Skip Connections支持
+修复: Hungarian Matcher索引越界 (完全重写)
 """
 
 import argparse
@@ -16,22 +14,21 @@ import torch.nn as nn
 import torch.nn.functional as F
 from torch.utils.data import DataLoader
 from torch.optim import AdamW
-from torch.optim.lr_scheduler import CosineAnnealingLR, OneCycleLR
+from torch.optim.lr_scheduler import OneCycleLR
 from tqdm import tqdm
 from typing import Dict, List, Tuple
 from scipy.optimize import linear_sum_assignment
 
-# 导入模型和数据
 from model.model import segmamba_mask2former_tiny, segmamba_mask2former_small, segmamba_mask2former_base
 from data.dataloader import NPYSegmentationDataset, get_default_transforms
 
 
 # ============================================================================
-# Hungarian Matcher - 修复版
+# Hungarian Matcher - 完全重写，避免索引问题
 # ============================================================================
 
 class HungarianMatcher(nn.Module):
-    """Hungarian Matcher for bipartite matching - 修复索引越界"""
+    """Hungarian Matcher - 安全版本"""
     
     def __init__(
         self,
@@ -48,69 +45,83 @@ class HungarianMatcher(nn.Module):
     
     @torch.no_grad()
     def forward(self, outputs, targets):
-        bs = outputs["pred_logits"].shape[0]
-        num_queries = outputs["pred_logits"].shape[1]
+        bs, num_queries = outputs["pred_logits"].shape[:2]
         
-        # Flatten
-        out_prob = outputs["pred_logits"].flatten(0, 1).softmax(-1)  # (B*Q, C+1)
-        out_mask = outputs["pred_masks"].flatten(0, 1)  # (B*Q, H, W)
-        
-        # Concatenate targets
-        tgt_ids = torch.cat([v for v in targets["labels"]])
-        tgt_mask = torch.cat([v for v in targets["masks"]])
-        
-        # 🔧 修复：确保tgt_ids在有效范围内 [0, num_classes]
-        # num_classes不包含background，所以有效范围是 [0, num_classes]
-        num_classes = out_prob.shape[-1] - 1  # 减去background类
-        tgt_ids = torch.clamp(tgt_ids, 0, num_classes)  # ← 关键修复
-        
-        # 1. Classification cost
-        cost_class = -out_prob[:, tgt_ids]
-        
-        # 2. Mask cost (point sampling)
-        out_mask_flat = out_mask.flatten(1)
-        tgt_mask_flat = tgt_mask.flatten(1).float()
-        
-        num_points = min(self.num_points, out_mask_flat.shape[1])
-        point_idx = torch.randperm(out_mask_flat.shape[1], device=out_mask.device)[:num_points]
-        
-        out_mask_sampled = out_mask_flat[:, point_idx].sigmoid()
-        tgt_mask_sampled = tgt_mask_flat[:, point_idx]
-        
-        # 🔧 修复：使用mean reduction避免广播问题
-        with torch.no_grad():
-            cost_mask_expanded = torch.stack([
-                F.binary_cross_entropy_with_logits(
-                    out_mask_flat[:, point_idx],
-                    tgt_mask_sampled[i:i+1].expand(out_mask_flat.shape[0], -1),
-                    reduction='none'
-                ).mean(-1)
-                for i in range(tgt_mask_sampled.shape[0])
-            ], dim=1)  # (B*Q, N)
-        
-        cost_mask = cost_mask_expanded
-        
-        # 3. Dice cost
-        numerator = 2 * (out_mask_sampled.unsqueeze(1) * tgt_mask_sampled.unsqueeze(0)).sum(-1)
-        denominator = out_mask_sampled.unsqueeze(1).sum(-1) + tgt_mask_sampled.unsqueeze(0).sum(-1) + 1e-4
-        cost_dice = 1 - numerator / denominator
-        
-        # Final cost
-        C = self.cost_class * cost_class + self.cost_mask * cost_mask + self.cost_dice * cost_dice
-        C = C.view(bs, num_queries, -1).cpu()
-        
-        # Hungarian matching
-        sizes = [len(v) for v in targets["labels"]]
+        # 不使用flatten，逐batch处理
         indices = []
-        start_idx = 0
-        for i, size in enumerate(sizes):
-            if size == 0:
-                indices.append((torch.tensor([], dtype=torch.long), torch.tensor([], dtype=torch.long)))
+        
+        for i in range(bs):
+            # 当前batch的预测
+            out_prob = outputs["pred_logits"][i].softmax(-1)  # (Q, C+1)
+            out_mask = outputs["pred_masks"][i]  # (Q, H, W)
+            
+            # 当前batch的GT
+            tgt_ids = targets["labels"][i]  # (N,)
+            tgt_mask = targets["masks"][i]  # (N, H, W)
+            
+            num_tgt = len(tgt_ids)
+            
+            # 如果没有target，返回空匹配
+            if num_tgt == 0:
+                indices.append((
+                    torch.tensor([], dtype=torch.long),
+                    torch.tensor([], dtype=torch.long)
+                ))
                 continue
-            cost_matrix = C[i, :, start_idx:start_idx+size]
-            src_idx, tgt_idx = linear_sum_assignment(cost_matrix)
-            indices.append((torch.as_tensor(src_idx, dtype=torch.long), torch.as_tensor(tgt_idx, dtype=torch.long)))
-            start_idx += size
+            
+            # 1. Classification cost - 安全版本
+            # 确保tgt_ids在有效范围内
+            num_classes = out_prob.shape[-1] - 1
+            tgt_ids_safe = torch.clamp(tgt_ids, 0, num_classes).long()
+            
+            # 使用gather避免索引问题
+            cost_class = -out_prob[:, tgt_ids_safe]  # (Q, N)
+            
+            # 2. Mask cost
+            out_mask_flat = out_mask.flatten(1)  # (Q, H*W)
+            tgt_mask_flat = tgt_mask.flatten(1).float()  # (N, H*W)
+            
+            # Point sampling
+            H, W = out_mask.shape[-2:]
+            num_points = min(self.num_points, H * W)
+            point_idx = torch.randperm(H * W, device=out_mask.device)[:num_points]
+            
+            out_mask_sampled = out_mask_flat[:, point_idx]  # (Q, P)
+            tgt_mask_sampled = tgt_mask_flat[:, point_idx]  # (N, P)
+            
+            # Mask BCE cost - 安全计算
+            out_mask_sampled_sig = out_mask_sampled.sigmoid()
+            cost_mask = []
+            for n in range(num_tgt):
+                # 计算每个query与第n个target的BCE
+                bce = F.binary_cross_entropy(
+                    out_mask_sampled_sig,
+                    tgt_mask_sampled[n:n+1].expand(num_queries, -1),
+                    reduction='none'
+                ).mean(dim=1)  # (Q,)
+                cost_mask.append(bce)
+            cost_mask = torch.stack(cost_mask, dim=1)  # (Q, N)
+            
+            # 3. Dice cost
+            numerator = 2 * (out_mask_sampled_sig.unsqueeze(1) * tgt_mask_sampled.unsqueeze(0)).sum(-1)
+            denominator = out_mask_sampled_sig.unsqueeze(1).sum(-1) + tgt_mask_sampled.unsqueeze(0).sum(-1) + 1e-4
+            cost_dice = 1 - numerator / denominator  # (Q, N)
+            
+            # Final cost
+            C = (
+                self.cost_class * cost_class +
+                self.cost_mask * cost_mask +
+                self.cost_dice * cost_dice
+            )
+            
+            # Hungarian matching
+            C_cpu = C.cpu().numpy()
+            src_idx, tgt_idx = linear_sum_assignment(C_cpu)
+            
+            indices.append((
+                torch.as_tensor(src_idx, dtype=torch.long),
+                torch.as_tensor(tgt_idx, dtype=torch.long)
+            ))
         
         return indices
 
@@ -157,7 +168,10 @@ class SetCriterion(nn.Module):
         
         for batch_idx, (src_idx, tgt_idx) in enumerate(indices):
             if len(src_idx) > 0:
-                target_classes[batch_idx, src_idx] = targets["labels"][batch_idx][tgt_idx]
+                # 确保索引安全
+                tgt_labels = targets["labels"][batch_idx][tgt_idx]
+                tgt_labels = torch.clamp(tgt_labels, 0, self.num_classes).long()
+                target_classes[batch_idx, src_idx] = tgt_labels
         
         loss_ce = F.cross_entropy(
             pred_logits.transpose(1, 2),
@@ -205,8 +219,11 @@ class SetCriterion(nn.Module):
             shift = num_uncertain_points * torch.arange(src_masks_points.shape[0], dtype=torch.long, device=src_masks.device)
             idx += shift.unsqueeze(1)
             
-            src_masks_points = src_masks_points.squeeze(1).flatten(0, 1)[idx].view(-1, num_uncertain_points)
-            target_masks_points = target_masks_points.squeeze(1).flatten(0, 1)[idx].view(-1, num_uncertain_points)
+            src_masks_points_flat = src_masks_points.squeeze(1).flatten(0, 1)
+            target_masks_points_flat = target_masks_points.squeeze(1).flatten(0, 1)
+            
+            src_masks_points = src_masks_points_flat[idx].view(-1, num_uncertain_points)
+            target_masks_points = target_masks_points_flat[idx].view(-1, num_uncertain_points)
             
             point_coords_rand = torch.rand(src_masks.shape[0], num_random_points, 2, device=src_masks.device)
             src_masks_points_rand = self._sample_points(src_masks.unsqueeze(1), point_coords_rand).squeeze(1)
@@ -251,7 +268,6 @@ class SetCriterion(nn.Module):
         losses.update(self.loss_labels(outputs, targets, indices))
         losses.update(self.loss_masks(outputs, targets, indices))
         
-        # Auxiliary losses
         if "aux_outputs" in outputs:
             for i, aux_outputs in enumerate(outputs["aux_outputs"]):
                 indices_aux = self.matcher(aux_outputs, targets)
@@ -264,11 +280,10 @@ class SetCriterion(nn.Module):
 
 
 # ============================================================================
-# Training/Validation functions
+# Training/Validation
 # ============================================================================
 
 def calculate_dice_score(pred_masks, gt_masks):
-    """Calculate Dice Score"""
     pred_masks_binary = []
     for pred_mask in pred_masks:
         pred_binary = (pred_mask.sigmoid() > 0.5).float()
@@ -336,10 +351,8 @@ def train_one_epoch(model, dataloader, criterion, optimizer, device, epoch):
         torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=0.1)
         optimizer.step()
         
-        # Calculate Dice
         dice = calculate_dice_score(outputs["pred_masks"], masks)
         
-        # Accumulate
         for k, v in losses.items():
             if k not in loss_dict_accumulated:
                 loss_dict_accumulated[k] = 0.0
@@ -415,75 +428,59 @@ def validate(model, dataloader, criterion, device):
 
 
 # ============================================================================
-# Main Training Script
+# Main
 # ============================================================================
 
 def main():
-    parser = argparse.ArgumentParser(description='SegMamba + Mask2Former Training - Fixed v2')
+    parser = argparse.ArgumentParser(description='SegMamba + Mask2Former Training')
     
-    # Data
     parser.add_argument('--data_root', type=str, required=True)
     parser.add_argument('--image_size', type=int, default=256)
     parser.add_argument('--num_classes', type=int, default=1)
     
-    # Model
     parser.add_argument('--model_size', type=str, default='small', choices=['tiny', 'small', 'base'])
     parser.add_argument('--num_queries', type=int, default=20)
     
-    # 正则化
     parser.add_argument('--drop_path_rate', type=float, default=0.0)
     parser.add_argument('--use_skip_connections', action='store_true')
     
-    # Training
     parser.add_argument('--batch_size', type=int, default=4)
     parser.add_argument('--epochs', type=int, default=100)
     parser.add_argument('--lr', type=float, default=5e-5)
     parser.add_argument('--weight_decay', type=float, default=1e-4)
     parser.add_argument('--num_workers', type=int, default=4)
     
-    # Matcher
     parser.add_argument('--cost_class', type=float, default=2.0)
     parser.add_argument('--cost_mask', type=float, default=5.0)
     parser.add_argument('--cost_dice', type=float, default=5.0)
     
-    # Loss weights
     parser.add_argument('--class_weight', type=float, default=2.0)
     parser.add_argument('--mask_weight', type=float, default=5.0)
     parser.add_argument('--dice_weight', type=float, default=5.0)
     parser.add_argument('--eos_coef', type=float, default=0.1)
     parser.add_argument('--aux_weight', type=float, default=0.4)
     
-    # Point sampling
     parser.add_argument('--num_points', type=int, default=12544)
     parser.add_argument('--oversample_ratio', type=float, default=3.0)
     parser.add_argument('--importance_sample_ratio', type=float, default=0.75)
     
-    # Output
     parser.add_argument('--output_dir', type=str, default='./outputs')
     parser.add_argument('--save_every', type=int, default=10)
     
     args = parser.parse_args()
     
-    # Setup
     os.makedirs(args.output_dir, exist_ok=True)
     device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
     
-    # Save config
     with open(os.path.join(args.output_dir, 'config.json'), 'w') as f:
         json.dump(vars(args), f, indent=2)
     
     print("="*80)
-    print("SegMamba + Mask2Former Training - Fixed v2")
+    print("SegMamba + Mask2Former Training")
     print("="*80)
     print(f"Device: {device}")
-    if args.drop_path_rate > 0:
-        print(f"DropPath Rate: {args.drop_path_rate}")
-    if args.use_skip_connections:
-        print(f"Skip Connections: Enabled")
     
-    # =========================================================================
-    # [1] DataLoaders
-    # =========================================================================
+    # DataLoaders
     print("\n[1] Creating DataLoaders...")
     
     train_dataset = NPYSegmentationDataset(
@@ -530,13 +527,10 @@ def main():
         }
     )
     
-    print(f"  Train: {len(train_dataset)} samples")
-    print(f"  Val: {len(val_dataset)} samples")
+    print(f"  Train: {len(train_dataset)}, Val: {len(val_dataset)}")
     
-    # =========================================================================
-    # [2] Model
-    # =========================================================================
-    print(f"\n[2] Creating model...")
+    # Model
+    print("\n[2] Creating model...")
     
     if args.model_size == 'tiny':
         model = segmamba_mask2former_tiny(
@@ -561,15 +555,10 @@ def main():
         )
     
     model = model.to(device)
+    print(f"  Parameters: {sum(p.numel() for p in model.parameters()) / 1e6:.2f}M")
     
-    num_params = sum(p.numel() for p in model.parameters())
-    print(f"  Model: {args.model_size}")
-    print(f"  Parameters: {num_params / 1e6:.2f}M")
-    
-    # =========================================================================
-    # [3] Criterion
-    # =========================================================================
-    print(f"\n[3] Creating criterion...")
+    # Criterion
+    print("\n[3] Creating criterion...")
     
     matcher = HungarianMatcher(
         cost_class=args.cost_class,
@@ -585,16 +574,13 @@ def main():
     }
     
     num_layers = model.get_num_layers()
-    aux_weight_dict = {}
     for i in range(num_layers - 1):
         decay = args.aux_weight ** (num_layers - i - 1)
-        aux_weight_dict.update({
+        weight_dict.update({
             f"loss_ce_{i}": args.class_weight * decay,
             f"loss_mask_{i}": args.mask_weight * decay,
             f"loss_dice_{i}": args.dice_weight * decay,
         })
-    
-    weight_dict.update(aux_weight_dict)
     
     criterion = SetCriterion(
         num_classes=args.num_classes,
@@ -606,75 +592,46 @@ def main():
         importance_sample_ratio=args.importance_sample_ratio,
     )
     
-    print(f"  ✓ Criterion created")
+    # Optimizer
+    print("\n[4] Creating optimizer...")
     
-    # =========================================================================
-    # [4] Optimizer & Scheduler
-    # =========================================================================
-    print(f"\n[4] Creating optimizer...")
+    optimizer = AdamW(model.parameters(), lr=args.lr, weight_decay=args.weight_decay)
+    scheduler = OneCycleLR(optimizer, max_lr=args.lr, epochs=args.epochs, steps_per_epoch=len(train_loader), pct_start=0.1)
     
-    optimizer = AdamW(
-        model.parameters(),
-        lr=args.lr,
-        weight_decay=args.weight_decay
-    )
-    
-    scheduler = OneCycleLR(
-        optimizer,
-        max_lr=args.lr,
-        epochs=args.epochs,
-        steps_per_epoch=len(train_loader),
-        pct_start=0.1,
-    )
-    
-    print(f"  ✓ Optimizer: AdamW (lr={args.lr}, wd={args.weight_decay})")
-    
-    # =========================================================================
-    # [5] Training Loop
-    # =========================================================================
-    print(f"\n[5] Starting training...")
+    # Training
+    print("\n[5] Training...")
     print("="*80)
     
     best_dice = 0.0
     
     for epoch in range(1, args.epochs + 1):
-        # Train
         train_losses = train_one_epoch(model, train_loader, criterion, optimizer, device, epoch)
-        
-        # Validate
         val_losses = validate(model, val_loader, criterion, device)
         
-        # Print
-        print(f"\nEpoch {epoch}/{args.epochs} Results:")
-        print(f"  Train Loss: {train_losses['total_loss']:.4f}")
-        print(f"  Train Dice Score: {train_losses['dice_score']:.4f}")
-        print(f"  Val Loss: {val_losses['total_loss']:.4f}")
-        print(f"  Val Dice Score: {val_losses['dice_score']:.4f}")
+        print(f"\nEpoch {epoch}/{args.epochs}:")
+        print(f"  Train: Loss {train_losses['total_loss']:.4f}, Dice {train_losses['dice_score']:.4f}")
+        print(f"  Val:   Loss {val_losses['total_loss']:.4f}, Dice {val_losses['dice_score']:.4f}")
         
-        # Save best
         if val_losses['dice_score'] > best_dice:
             best_dice = val_losses['dice_score']
             torch.save({
                 'epoch': epoch,
                 'model_state_dict': model.state_dict(),
-                'optimizer_state_dict': optimizer.state_dict(),
                 'best_dice': best_dice,
             }, os.path.join(args.output_dir, 'best_model.pth'))
-            print(f"  ✓ New best model! Dice Score: {best_dice:.4f}")
+            print(f"  ✓ Best: {best_dice:.4f}")
         
-        # Save periodic
         if epoch % args.save_every == 0:
             torch.save({
                 'epoch': epoch,
                 'model_state_dict': model.state_dict(),
-                'optimizer_state_dict': optimizer.state_dict(),
             }, os.path.join(args.output_dir, f'checkpoint_epoch_{epoch}.pth'))
         
         scheduler.step()
     
-    print("\n" + "="*80)
+    print(f"\n{'='*80}")
     print(f"Training completed! Best Dice: {best_dice:.4f}")
-    print("="*80)
+    print(f"{'='*80}")
 
 
 if __name__ == '__main__':
