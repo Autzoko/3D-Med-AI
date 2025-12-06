@@ -80,57 +80,58 @@ class LayerNorm(nn.Module):
 class MambaLayer(nn.Module):
     def __init__(self, dim, d_state=16, d_conv=4, expand=2, num_slices=None, drop_path=0.0):
         """
-        2D MambaLayer with enhanced residual connections
-        
-        新增参数:
-            drop_path: DropPath rate (default: 0.0, 向后兼容)
+        2D MambaLayer：把整张特征图展平成序列 (B, H*W, C)，
+        用 Mamba 做全局建模，再还原回 (B, C, H, W)。
+
+        参数：
+            dim: 通道数 C
+            d_state, d_conv, expand: 传给 Mamba 的配置
+            num_slices: 保留接口（和 3D 版一致），这里不强依赖
+            drop_path: stochastic depth 概率
         """
         super().__init__()
         self.dim = dim
-        self.norm = nn.LayerNorm(dim)
-        self.mamba = Mamba(
-                d_model=dim,
-                d_state=d_state,
-                d_conv=d_conv,
-                expand=expand,
-                bimamba_type="v3",
-                nslices=num_slices,
-        )
-        # 新增: DropPath for regularization
-        self.drop_path = DropPath(drop_path) if drop_path > 0. else nn.Identity()
-    
-    def forward(self, x):
-        """
-        Enhanced residual: x = x + DropPath(Mamba(Norm(x)))
-        
-        Args:
-            x: input tensor of shape (B, C, H, W)
-        Returns:
-            output tensor of shape (B, C, H, W)
-        """
-        B, C = x.shape[:2]
-        assert C == self.dim
-        
-        # 保存shortcut
-        shortcut = x
-        
-        # For 2D: flatten spatial dimensions H*W
-        n_tokens = x.shape[2:].numel()
-        img_dims = x.shape[2:]
-        
-        # (B, C, H, W) -> (B, H*W, C)
-        x_flat = x.reshape(B, C, n_tokens).transpose(-1, -2)
-        
-        # Pre-Norm + Mamba
-        x_norm = self.norm(x_flat)
-        x_mamba = self.mamba(x_norm)
 
-        # (B, H*W, C) -> (B, C, H, W)
-        out = x_mamba.transpose(-1, -2).reshape(B, C, *img_dims)
-        
-        # 增强的残差连接: shortcut + DropPath(output)
+        # 对序列的最后一维（通道维 C）做 LayerNorm
+        self.norm = nn.LayerNorm(dim)
+
+        # 核心 Mamba 块：输入/输出形状都是 (B, L, C)
+        self.mamba = Mamba(
+            d_model=dim,
+            d_state=d_state,
+            d_conv=d_conv,
+            expand=expand,
+            bimamba_type="v3",     # 和你 3D 版保持一致
+            nslices=num_slices if num_slices is not None else 1
+        )
+
+        # DropPath 残差
+        self.drop_path = DropPath(drop_path) if drop_path > 0.0 else nn.Identity()
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        """
+        输入:  x, 形状 (B, C, H, W)
+        输出: out, 形状 (B, C, H, W)
+        """
+        B, C, H, W = x.shape
+        assert C == self.dim, f"Channel mismatch: got {C}, expected {self.dim}"
+
+        # 残差分支
+        shortcut = x
+
+        # ===== 关键：flatten 成全局序列 =====
+        # (B, C, H, W) -> (B, C, H*W) -> (B, H*W, C)
+        x_flat = x.reshape(B, C, H * W).transpose(1, 2)
+
+        # Pre-Norm + Mamba
+        x_norm = self.norm(x_flat)          # (B, L, C)
+        x_mamba = self.mamba(x_norm)        # (B, L, C)
+
+        # 再还原回 2D feature map
+        out = x_mamba.transpose(1, 2).reshape(B, C, H, W)
+
+        # 残差 + DropPath
         out = shortcut + self.drop_path(out)
-        
         return out
 
     
