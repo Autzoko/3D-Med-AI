@@ -634,9 +634,17 @@ def calculate_dice_score(pred_masks, pred_logits, gt_masks, threshold=0.5):
         pred_masks[b, best_queries[b]] for b in range(B)
     ])  # (B, H, W)
     
+    # 上采样pred到gt的尺寸
+    final_masks = F.interpolate(
+        final_masks.unsqueeze(1),  # (B, 1, H, W)
+        size=gt_masks.shape[-2:],   # (gt_H, gt_W)
+        mode='bilinear',
+        align_corners=False
+    ).squeeze(1)  # (B, gt_H, gt_W)
+    
     # 二值化
-    pred_binary = (final_masks.sigmoid() > threshold).float()  # (B, H, W)
-    gt_binary = (gt_masks.squeeze(1) > 0).float()  # (B, H, W)
+    pred_binary = (final_masks.sigmoid() > threshold).float()  # (B, gt_H, gt_W)
+    gt_binary = (gt_masks.squeeze(1) > 0).float()  # (B, gt_H, gt_W)
     
     # 计算Dice Score: 2 * |A∩B| / (|A| + |B|)
     intersection = (pred_binary * gt_binary).sum(dim=[1, 2])  # (B,)
